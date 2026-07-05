@@ -1,19 +1,19 @@
-name: Sync to Hugging Face
+name: Sync to Hugging Face Hub
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
 jobs:
-  sync-to-hub:
+  sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
         with:
           fetch-depth: 0
-          lfs: true
-      - name: Push to hub
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: git push --force https://khadeejahkhurram09:$HF_TOKEN@huggingface.co/spaces/scholarwave-studios/scholarwave-hub main
+      - uses: huggingface/hub-sync@v0.1.0
+        with:
+          github_repo_id: khadeejahkhurram09/Study-App
+          huggingface_repo_id: scholarwave-studios/scholarwave-hub
+          hf_token: ${{ secrets.HF_TOKEN }}
+          space_sdk: streamlit
