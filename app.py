@@ -10,36 +10,45 @@ from datetime import datetime
  
 import streamlit as st
 
-# --- SIMPLE ACCESS CONTROL ---
 def check_password():
-    """Returns True if the user had the correct password."""
+    """Returns True if the user has the correct password."""
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
 
-    # If already logged in, move past
     if st.session_state["password_correct"]:
         return True
 
-    # Show login screen
-    st.title("🌊 Welcome to Scholarwave Hub")
-    st.subheader("Please enter the student access key to begin studying.")
+    # Main welcome header
+    st.title("🌊 Scholarwave Hub AI")
     
-    user_password = st.text_input("Access Key", type="password")
-    if st.button("Unlock Dashboard"):
-        # You can change "scholarwave2026" to whatever password you want!
-        if user_password == "scholarwave2026":
-            st.session_state["password_correct"] = True
-            st.rerun()
-        else:
-            st.error("❌ Invalid Access Key. Please check with your administrator.")
+    # Split the screen into two columns: one for logging in, one for instructions
+    col1, col2 = st.columns([2, 1.5])
+    
+    with col1:
+        st.subheader("🔑 Unlock AI Features")
+        user_password = st.text_input("Enter Access Key", type="password")
+        if st.button("Unlock AI Assistant"):
+            if user_password == "scholarwave2026":
+                st.session_state["password_correct"] = True
+                st.rerun()
+            else:
+                st.error("❌ Invalid Access Key.")
+                
+    with col2:
+        st.subheader("📢 How to get an Access Key?")
+        st.info(
+            """
+            **Students & Teachers:** If you are new to Scholarwave Hub, you can get your free beta testing key instantly by:
+            * 📨 Checking the pin in our school WhatsApp group.
+            * 🏫 Asking your computer science or subject teacher.
+            * ✉️ Dropping a quick email to: `yourname@email.com`
+            """
+        )
     return False
 
-# Stop execution if the user hasn't logged in yet
-if not check_password():
-    st.stop()
-
-# ---------------------------------------------
-# YOUR EXISTING APP CODE STARTS HERE BELOW...
+# Drop this inside the specific page or tab where your AI code lives!
+# if not check_password():
+#     st.stop()
 from dotenv import load_dotenv
 from openai import AzureOpenAI
  
