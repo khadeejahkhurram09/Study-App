@@ -9,6 +9,37 @@ from pathlib import Path
 from datetime import datetime
  
 import streamlit as st
+
+# --- SIMPLE ACCESS CONTROL ---
+def check_password():
+    """Returns True if the user had the correct password."""
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+
+    # If already logged in, move past
+    if st.session_state["password_correct"]:
+        return True
+
+    # Show login screen
+    st.title("🌊 Welcome to Scholarwave Hub")
+    st.subheader("Please enter the student access key to begin studying.")
+    
+    user_password = st.text_input("Access Key", type="password")
+    if st.button("Unlock Dashboard"):
+        # You can change "scholarwave2026" to whatever password you want!
+        if user_password == "scholarwave2026":
+            st.session_state["password_correct"] = True
+            st.rerun()
+        else:
+            st.error("❌ Invalid Access Key. Please check with your administrator.")
+    return False
+
+# Stop execution if the user hasn't logged in yet
+if not check_password():
+    st.stop()
+
+# ---------------------------------------------
+# YOUR EXISTING APP CODE STARTS HERE BELOW...
 from dotenv import load_dotenv
 from openai import AzureOpenAI
  
