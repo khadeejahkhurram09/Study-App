@@ -1791,6 +1791,135 @@ def _render_study_streak_sidebar():
             st.rerun()
 
 
+def _render_mobile_install_prompt():
+        """Show a lightweight Add-to-Home-Screen prompt on mobile browsers."""
+        install_prompt_html = """
+        <script>
+            (function () {
+                const parentWin = window.parent || window;
+                const doc = parentWin.document;
+                const installUiId = 'sw-install-cta';
+
+                if (doc.getElementById(installUiId)) {
+                    return;
+                }
+
+                let deferredPrompt = null;
+                const isMobile = /Android|iPhone|iPad|iPod/i.test(parentWin.navigator.userAgent || '');
+                if (!isMobile) {
+                    return;
+                }
+
+                const isStandalone = parentWin.matchMedia && parentWin.matchMedia('(display-mode: standalone)').matches;
+                const isIosStandalone = parentWin.navigator.standalone === true;
+                if (isStandalone || isIosStandalone) {
+                    return;
+                }
+
+                const box = doc.createElement('div');
+                box.id = installUiId;
+                box.style.position = 'fixed';
+                box.style.right = '14px';
+                box.style.bottom = '14px';
+                box.style.zIndex = '2147483647';
+                box.style.background = 'linear-gradient(135deg, #0f6a8f, #17a1a5)';
+                box.style.color = '#ffffff';
+                box.style.padding = '10px 12px';
+                box.style.borderRadius = '12px';
+                box.style.boxShadow = '0 10px 24px rgba(0,0,0,.25)';
+                box.style.fontFamily = 'system-ui, -apple-system, Segoe UI, sans-serif';
+                box.style.maxWidth = '280px';
+                box.style.display = 'none';
+
+                const title = doc.createElement('div');
+                title.textContent = 'Install Study Hub';
+                title.style.fontWeight = '700';
+                title.style.marginBottom = '6px';
+
+                const hint = doc.createElement('div');
+                hint.style.fontSize = '12px';
+                hint.style.lineHeight = '1.35';
+                hint.style.marginBottom = '8px';
+
+                const row = doc.createElement('div');
+                row.style.display = 'flex';
+                row.style.gap = '8px';
+
+                const installBtn = doc.createElement('button');
+                installBtn.textContent = 'Add to Home Screen';
+                installBtn.style.border = 'none';
+                installBtn.style.borderRadius = '8px';
+                installBtn.style.padding = '7px 10px';
+                installBtn.style.fontWeight = '700';
+                installBtn.style.cursor = 'pointer';
+                installBtn.style.background = '#ffffff';
+                installBtn.style.color = '#0f6a8f';
+
+                const dismissBtn = doc.createElement('button');
+                dismissBtn.textContent = 'Not now';
+                dismissBtn.style.border = '1px solid rgba(255,255,255,.5)';
+                dismissBtn.style.borderRadius = '8px';
+                dismissBtn.style.padding = '7px 10px';
+                dismissBtn.style.cursor = 'pointer';
+                dismissBtn.style.background = 'transparent';
+                dismissBtn.style.color = '#ffffff';
+
+                row.appendChild(installBtn);
+                row.appendChild(dismissBtn);
+                box.appendChild(title);
+                box.appendChild(hint);
+                box.appendChild(row);
+                doc.body.appendChild(box);
+
+                function showIosHint() {
+                    hint.textContent = 'On iPhone/iPad: tap Share, then Add to Home Screen.';
+                    installBtn.style.display = 'none';
+                    box.style.display = 'block';
+                }
+
+                function showInstallButton() {
+                    hint.textContent = 'Get quick access from your home screen.';
+                    installBtn.style.display = 'inline-block';
+                    box.style.display = 'block';
+                }
+
+                function handleBeforeInstallPrompt(e) {
+                    e.preventDefault();
+                    deferredPrompt = e;
+                    showInstallButton();
+                }
+
+                parentWin.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+                window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+
+                installBtn.addEventListener('click', async function () {
+                    if (!deferredPrompt) {
+                        return;
+                    }
+                    deferredPrompt.prompt();
+                    try {
+                        await deferredPrompt.userChoice;
+                    } catch (err) {
+                        // Ignore user dismissal and browser-specific prompt errors.
+                    }
+                    deferredPrompt = null;
+                    box.style.display = 'none';
+                });
+
+                dismissBtn.addEventListener('click', function () {
+                    box.style.display = 'none';
+                });
+
+                const isIos = /iPhone|iPad|iPod/i.test(parentWin.navigator.userAgent || '');
+                if (isIos) {
+                    showIosHint();
+                }
+            })();
+        </script>
+        """
+        st.components.v1.html(install_prompt_html, height=0)
+
+
 # --------------------------------------------------------------------------- #
 # UI — Teacher
 # --------------------------------------------------------------------------- #
@@ -3112,6 +3241,7 @@ def student_view(model):
 # --------------------------------------------------------------------------- #
 def main():
     st.set_page_config(page_title="ScholarWave Learning Hub", page_icon="🌊", layout="wide")
+    _render_mobile_install_prompt()
 
     create_tables()
     create_syllabus_table()
