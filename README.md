@@ -2,7 +2,7 @@
 title: Scholarwave Hub
 emoji: 🌊
 colorFrom: blue
-colorTo: cyan
+colorTo: blue
 sdk: docker
 pinned: false
 ---
