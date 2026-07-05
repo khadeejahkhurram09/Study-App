@@ -16,4 +16,3 @@ jobs:
           github_repo_id: khadeejahkhurram09/Study-App
           huggingface_repo_id: scholarwave-studios/scholarwave-hub
           hf_token: ${{ secrets.HF_TOKEN }}
-          space_sdk: streamlit
