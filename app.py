@@ -4,6 +4,7 @@ import re
 import json
 import uuid
 import sqlite3
+import hashlib
 from pathlib import Path
 from datetime import datetime
  
@@ -72,11 +73,12 @@ MODELS = {
  
 # The AI tutor model picker has been removed from the UI (per Sharks Academy's
 # request) — we just quietly use the first configured model behind the scenes.
-DEFAULT_MODEL = next(iter(MODELS))
+DEFAULT_MODEL = next(iter(MODELS), "GPT-5.5")
  
  
 def ai_ready(model):
-    return bool(MODELS[model][1] and MODELS[model][2])
+    model_config = MODELS.get(model)
+    return bool(model_config and model_config[1] and model_config[2])
  
  
 # --------------------------------------------------------------------------- #
@@ -128,18 +130,53 @@ def delete_lecture(lid: str) -> None:
  
 def parse_json(text):
     if not text:
-        return None
-    cleaned = re.sub(r"```(?:json)?", "", text).strip()
+        return {}
+
+    cleaned = text.strip()
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        m = re.search(r"(\{.*\}|\[.*\])", cleaned, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(1))
-            except json.JSONDecodeError:
-                return None
-    return None
+        pass
+
+    fenced_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, flags=re.IGNORECASE)
+    for block in fenced_blocks:
+        try:
+            return json.loads(block.strip())
+        except json.JSONDecodeError:
+            continue
+
+    starts = [i for i, ch in enumerate(cleaned) if ch in "[{"]
+    for start in starts:
+        opening = cleaned[start]
+        closing = "}" if opening == "{" else "]"
+        depth = 0
+        in_string = False
+        escape = False
+        for idx in range(start, len(cleaned)):
+            ch = cleaned[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == opening:
+                depth += 1
+            elif ch == closing:
+                depth -= 1
+                if depth == 0:
+                    candidate = cleaned[start:idx + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+
+    return {}
 
 
 def parse_score_value(value, total_marks):
@@ -167,8 +204,12 @@ def parse_score_value(value, total_marks):
 # AI helpers
 # --------------------------------------------------------------------------- #
 def _call(model, prompt, system, max_tokens=700):
-    deployment, endpoint, key = MODELS[model]
-    if not endpoint or not key:
+    model_config = MODELS.get(model)
+    if not model_config:
+        return {"ok": False, "text": f"⚠️ {model}: Model is not registered in this environment."}
+
+    deployment, endpoint, key = model_config
+    if not deployment or not endpoint or not key:
         return {"ok": False, "text": f"⚠️ {model}: AI is not configured in this environment."}
     try:
         client = AzureOpenAI(api_key=key, azure_endpoint=endpoint, api_version=API_VERSION)
@@ -309,10 +350,10 @@ def get_conn():
  
  
 def create_tables():
-    conn = get_conn()
-    cursor = conn.cursor()
+    with get_conn() as conn:
+        cursor = conn.cursor()
  
-    cursor.execute("""
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS students (
             student_id INTEGER PRIMARY KEY AUTOINCREMENT,
             full_name TEXT NOT NULL,
@@ -322,17 +363,17 @@ def create_tables():
             performance_threshold INTEGER DEFAULT 60,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-    """)
+        """)
  
-    cursor.execute("""
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS subjects (
             subject_id INTEGER PRIMARY KEY AUTOINCREMENT,
             subject_name TEXT UNIQUE NOT NULL,
             subject_code TEXT UNIQUE
         );
-    """)
+        """)
  
-    cursor.execute("""
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS teachers (
             teacher_id INTEGER PRIMARY KEY AUTOINCREMENT,
             full_name TEXT NOT NULL,
@@ -342,9 +383,9 @@ def create_tables():
             username TEXT UNIQUE,
             password_hash TEXT
         );
-    """)
+        """)
  
-    cursor.execute("""
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS teacher_subjects (
             teacher_id INTEGER NOT NULL,
             subject_id INTEGER NOT NULL,
@@ -353,9 +394,9 @@ def create_tables():
             FOREIGN KEY (teacher_id) REFERENCES teachers(teacher_id) ON DELETE CASCADE,
             FOREIGN KEY (subject_id) REFERENCES subjects(subject_id) ON DELETE CASCADE
         );
-    """)
+        """)
  
-    cursor.execute("""
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS student_preferences (
             preference_id INTEGER PRIMARY KEY AUTOINCREMENT,
             student_id INTEGER NOT NULL,
@@ -368,58 +409,55 @@ def create_tables():
             FOREIGN KEY (preferred_teacher_id) REFERENCES teachers(teacher_id) ON DELETE SET NULL,
             UNIQUE (student_id, subject_id, priority)
         );
-    """)
- 
-    conn.commit()
-    conn.close()
+        """)
+
+        conn.commit()
     ensure_profile_columns()
 
 
 def ensure_profile_columns():
-    conn = get_conn()
-    cursor = conn.cursor()
-    for statement in [
-        "ALTER TABLE students ADD COLUMN performance_threshold INTEGER DEFAULT 60",
-        "ALTER TABLE teachers ADD COLUMN grade_level TEXT",
-        "ALTER TABLE teachers ADD COLUMN username TEXT",
-        "ALTER TABLE teachers ADD COLUMN password_hash TEXT",
-        "ALTER TABLE teacher_subjects ADD COLUMN grade_level TEXT DEFAULT ''",
-        "ALTER TABLE flashcards ADD COLUMN grade_level TEXT",
-        "ALTER TABLE syllabus_chapters ADD COLUMN grade_level TEXT DEFAULT ''",
-        "ALTER TABLE syllabus_documents ADD COLUMN grade_level TEXT",
-        "ALTER TABLE assessments ADD COLUMN exam_duration_minutes INTEGER DEFAULT 60",
-        "ALTER TABLE past_papers ADD COLUMN grade_level TEXT",
-        "ALTER TABLE past_papers ADD COLUMN duration_minutes INTEGER DEFAULT 60",
-        "ALTER TABLE assessment_submissions ADD COLUMN completed_in_time INTEGER DEFAULT 1",
-        "ALTER TABLE assessment_submissions ADD COLUMN answer_file_path TEXT",
-        "ALTER TABLE assessment_submissions ADD COLUMN self_check_enabled INTEGER DEFAULT 0",
-        "ALTER TABLE assessment_submissions ADD COLUMN teacher_check_enabled INTEGER DEFAULT 0",
-        "ALTER TABLE assessment_submissions ADD COLUMN ai_check_enabled INTEGER DEFAULT 0",
-    ]:
-        try:
-            cursor.execute(statement)
-        except sqlite3.OperationalError:
-            pass
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        for statement in [
+            "ALTER TABLE students ADD COLUMN performance_threshold INTEGER DEFAULT 60",
+            "ALTER TABLE teachers ADD COLUMN grade_level TEXT",
+            "ALTER TABLE teachers ADD COLUMN username TEXT",
+            "ALTER TABLE teachers ADD COLUMN password_hash TEXT",
+            "ALTER TABLE teacher_subjects ADD COLUMN grade_level TEXT DEFAULT ''",
+            "ALTER TABLE flashcards ADD COLUMN grade_level TEXT",
+            "ALTER TABLE syllabus_chapters ADD COLUMN grade_level TEXT DEFAULT ''",
+            "ALTER TABLE syllabus_documents ADD COLUMN grade_level TEXT",
+            "ALTER TABLE assessments ADD COLUMN exam_duration_minutes INTEGER DEFAULT 60",
+            "ALTER TABLE past_papers ADD COLUMN grade_level TEXT",
+            "ALTER TABLE past_papers ADD COLUMN duration_minutes INTEGER DEFAULT 60",
+            "ALTER TABLE assessment_submissions ADD COLUMN completed_in_time INTEGER DEFAULT 1",
+            "ALTER TABLE assessment_submissions ADD COLUMN answer_file_path TEXT",
+            "ALTER TABLE assessment_submissions ADD COLUMN self_check_enabled INTEGER DEFAULT 0",
+            "ALTER TABLE assessment_submissions ADD COLUMN teacher_check_enabled INTEGER DEFAULT 0",
+            "ALTER TABLE assessment_submissions ADD COLUMN ai_check_enabled INTEGER DEFAULT 0",
+        ]:
+            try:
+                cursor.execute(statement)
+            except sqlite3.OperationalError:
+                pass
+        conn.commit()
 
 
 def seed_subjects():
     """Keep the `subjects` table in sync with the app's SUBJECTS list."""
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.executemany(
-        "INSERT OR IGNORE INTO subjects (subject_name) VALUES (?);",
-        [(s,) for s in SUBJECTS]
-    )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.executemany(
+            "INSERT OR IGNORE INTO subjects (subject_name) VALUES (?);",
+            [(s,) for s in SUBJECTS]
+        )
+        conn.commit()
 
 
 def create_syllabus_table():
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS syllabus_chapters (
             chapter_id INTEGER PRIMARY KEY AUTOINCREMENT,
             subject_name TEXT NOT NULL,
@@ -428,9 +466,8 @@ def create_syllabus_table():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE (subject_name, grade_level, chapter_name)
         );
-    """)
-    conn.commit()
-    conn.close()
+        """)
+        conn.commit()
 
 
 def seed_syllabus_chapters():
@@ -452,74 +489,70 @@ def seed_syllabus_chapters():
         "Geography": ["Population", "Settlement", "Natural environment", "Economic development"],
         "History": ["Modern world history", "Regional studies", "Source analysis", "Historical interpretation"],
     }
-    conn = get_conn()
-    cursor = conn.cursor()
-    for subject_name, chapters in default_chapters.items():
-        for chapter_name in chapters:
-            cursor.execute(
-                "INSERT OR IGNORE INTO syllabus_chapters (subject_name, chapter_name) VALUES (?, ?);",
-                (subject_name, chapter_name),
-            )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        for subject_name, chapters in default_chapters.items():
+            for chapter_name in chapters:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO syllabus_chapters (subject_name, chapter_name) VALUES (?, ?);",
+                    (subject_name, chapter_name),
+                )
+        conn.commit()
 
 
 def get_syllabus_chapters(subject_name, grade_level=None):
-    conn = get_conn()
-    cursor = conn.cursor()
-    if grade_level:
-        cursor.execute(
-            "SELECT chapter_name FROM syllabus_chapters WHERE subject_name = ? AND (grade_level = ? OR grade_level = '') ORDER BY chapter_name;",
-            (subject_name, grade_level),
-        )
-    else:
-        cursor.execute(
-            "SELECT chapter_name FROM syllabus_chapters WHERE subject_name = ? ORDER BY chapter_name;",
-            (subject_name,),
-        )
-    rows = cursor.fetchall()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        if grade_level:
+            cursor.execute(
+                "SELECT chapter_name FROM syllabus_chapters WHERE subject_name = ? AND (grade_level = ? OR grade_level = '') ORDER BY chapter_name;",
+                (subject_name, grade_level),
+            )
+        else:
+            cursor.execute(
+                "SELECT chapter_name FROM syllabus_chapters WHERE subject_name = ? ORDER BY chapter_name;",
+                (subject_name,),
+            )
+        rows = cursor.fetchall()
     return [row[0] for row in rows]
 
 
 def add_syllabus_chapter(subject_name, chapter_name, grade_level=None):
     if not subject_name or not chapter_name:
         return False
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR IGNORE INTO syllabus_chapters (subject_name, grade_level, chapter_name) VALUES (?, ?, ?);",
-        (subject_name.strip(), (grade_level or "").strip(), chapter_name.strip()),
-    )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO syllabus_chapters (subject_name, grade_level, chapter_name) VALUES (?, ?, ?);",
+            (subject_name.strip(), (grade_level or "").strip(), chapter_name.strip()),
+        )
+        conn.commit()
     return True
 
 
 def delete_syllabus_chapter(subject_name, chapter_name, grade_level=None):
     if not subject_name or not chapter_name:
         return False
-    conn = get_conn()
-    cursor = conn.cursor()
-    if grade_level:
-        cursor.execute(
-            "DELETE FROM syllabus_chapters WHERE subject_name = ? AND chapter_name = ? AND (grade_level = ? OR grade_level = '');",
-            (subject_name.strip(), chapter_name.strip(), grade_level.strip()),
-        )
-    else:
-        cursor.execute(
-            "DELETE FROM syllabus_chapters WHERE subject_name = ? AND chapter_name = ?;",
-            (subject_name.strip(), chapter_name.strip()),
-        )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        if grade_level:
+            cursor.execute(
+                "DELETE FROM syllabus_chapters WHERE subject_name = ? AND chapter_name = ? AND (grade_level = ? OR grade_level = '');",
+                (subject_name.strip(), chapter_name.strip(), grade_level.strip()),
+            )
+        else:
+            cursor.execute(
+                "DELETE FROM syllabus_chapters WHERE subject_name = ? AND chapter_name = ?;",
+                (subject_name.strip(), chapter_name.strip()),
+            )
+        conn.commit()
     return True
 
 
 def create_teacher_questions_table():
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS teacher_questions (
             question_id INTEGER PRIMARY KEY AUTOINCREMENT,
             student_id INTEGER,
@@ -529,56 +562,51 @@ def create_teacher_questions_table():
             question_text TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-    """)
-    conn.commit()
-    conn.close()
+        """)
+        conn.commit()
 
 
 def save_teacher_question(student_id, subject_name, teacher_id, question_text, student_name=None):
     if not subject_name or not question_text:
         return False
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO teacher_questions (student_id, student_name, subject_name, teacher_id, question_text) VALUES (?, ?, ?, ?, ?);",
-        (student_id, student_name or "Student", subject_name.strip(), teacher_id, question_text.strip()),
-    )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO teacher_questions (student_id, student_name, subject_name, teacher_id, question_text) VALUES (?, ?, ?, ?, ?);",
+            (student_id, student_name or "Student", subject_name.strip(), teacher_id, question_text.strip()),
+        )
+        conn.commit()
     return True
 
 
 def get_teacher_questions(teacher_id):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
         SELECT question_id, student_name, subject_name, question_text, created_at
         FROM teacher_questions
         WHERE teacher_id IS NULL OR teacher_id = ?
         ORDER BY created_at DESC;
     """, (teacher_id,))
-    rows = cursor.fetchall()
-    conn.close()
+        rows = cursor.fetchall()
     return rows
  
  
 def get_student_by_roll(roll_number):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT student_id, full_name, grade_level, email FROM students WHERE roll_number = ?;",
-                   (roll_number,))
-    row = cursor.fetchone()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT student_id, full_name, grade_level, email FROM students WHERE roll_number = ?;",
+                       (roll_number,))
+        row = cursor.fetchone()
     return row  # (student_id, full_name, grade_level, email) or None
  
  
 def get_student_by_id(student_id):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT student_id, full_name, roll_number, grade_level, email FROM students WHERE student_id = ?;",
-                   (student_id,))
-    row = cursor.fetchone()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT student_id, full_name, roll_number, grade_level, email FROM students WHERE student_id = ?;",
+                       (student_id,))
+        row = cursor.fetchone()
     return row  # (student_id, full_name, roll_number, grade_level, email) or None
  
  
@@ -588,42 +616,37 @@ def register_student(full_name, roll_number, grade_level, email):
     Roll format is YYYYNNN, where NNN is the registration sequence for that year.
     Returns (student_id, roll_number) on success, or (None, None) on failure.
     """
-    conn = get_conn()
-    cursor = conn.cursor()
     current_year = datetime.now().year
 
-    # Retry a few times in case of concurrent registrations creating the same sequence.
-    for _ in range(5):
-        cursor.execute(
-            "SELECT COUNT(*) FROM students WHERE roll_number LIKE ?;",
-            (f"{current_year}%",),
-        )
-        current_count = int(cursor.fetchone()[0] or 0)
-        next_roll = f"{current_year}{current_count + 1:03d}"
+    with get_conn() as conn:
+        cursor = conn.cursor()
 
-        try:
+        # Retry a few times in case of concurrent registrations creating the same sequence.
+        for _ in range(5):
             cursor.execute(
-                "INSERT INTO students (full_name, roll_number, grade_level, email) VALUES (?, ?, ?, ?);",
-                (full_name, next_roll, grade_level, email)
+                "SELECT COUNT(*) FROM students WHERE roll_number LIKE ?;",
+                (f"{current_year}%",),
             )
-            conn.commit()
-            return cursor.lastrowid, next_roll
-        except sqlite3.IntegrityError:
-            # If roll_number collided, loop and try the next available sequence.
-            continue
+            current_count = int(cursor.fetchone()[0] or 0)
+            next_roll = f"{current_year}{current_count + 1:03d}"
 
-    try:
+            try:
+                cursor.execute(
+                    "INSERT INTO students (full_name, roll_number, grade_level, email) VALUES (?, ?, ?, ?);",
+                    (full_name, next_roll, grade_level, email)
+                )
+                conn.commit()
+                return cursor.lastrowid, next_roll
+            except sqlite3.IntegrityError:
+                # If roll_number collided, loop and try the next available sequence.
+                continue
+
         conn.rollback()
-        return None, None
-    finally:
-        conn.close()
+    return None, None
  
  
 def register_teacher_for_subjects(full_name, email, subject_names, grade_level=None, username=None, password=None):
     """Create the teacher if needed, then link them to each chosen subject."""
-    conn = get_conn()
-    cursor = conn.cursor()
-
     grade_levels = []
     if isinstance(grade_level, list):
         grade_levels = [g for g in grade_level if g]
@@ -632,61 +655,59 @@ def register_teacher_for_subjects(full_name, email, subject_names, grade_level=N
     if not grade_levels:
         grade_levels = [""]
     grade_level_text = ", ".join([g for g in grade_levels if g]) or None
- 
-    cursor.execute("SELECT teacher_id FROM teachers WHERE full_name = ?;", (full_name,))
-    row = cursor.fetchone()
-    if row:
-        teacher_id = row[0]
-        cursor.execute("UPDATE teachers SET email = ?, grade_level = ? WHERE teacher_id = ?;",
-                   (email, grade_level_text, teacher_id))
-        if username and password:
-            import hashlib
-            password_hash = hashlib.sha256(password.encode()).hexdigest()
-            cursor.execute("UPDATE teachers SET username = ?, password_hash = ? WHERE teacher_id = ?;",
-                           (username, password_hash, teacher_id))
-    else:
-        import hashlib
-        password_hash = hashlib.sha256(password.encode()).hexdigest() if password else None
-        cursor.execute("INSERT INTO teachers (full_name, email, grade_level, username, password_hash) VALUES (?, ?, ?, ?, ?);",
-                       (full_name, email, grade_level_text, username, password_hash))
-        teacher_id = cursor.lastrowid
 
-    for subject_name in subject_names:
-        cursor.execute("SELECT subject_id FROM subjects WHERE subject_name = ?;", (subject_name,))
-        srow = cursor.fetchone()
-        if srow:
-            for g in grade_levels:
-                cursor.execute(
-                    "INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_id, grade_level) VALUES (?, ?, ?);",
-                    (teacher_id, srow[0], g)
-                )
- 
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT teacher_id FROM teachers WHERE full_name = ?;", (full_name,))
+        row = cursor.fetchone()
+        if row:
+            teacher_id = row[0]
+            cursor.execute("UPDATE teachers SET email = ?, grade_level = ? WHERE teacher_id = ?;",
+                       (email, grade_level_text, teacher_id))
+            if username and password:
+                password_hash = hashlib.sha256(password.encode()).hexdigest()
+                cursor.execute("UPDATE teachers SET username = ?, password_hash = ? WHERE teacher_id = ?;",
+                               (username, password_hash, teacher_id))
+        else:
+            password_hash = hashlib.sha256(password.encode()).hexdigest() if password else None
+            cursor.execute("INSERT INTO teachers (full_name, email, grade_level, username, password_hash) VALUES (?, ?, ?, ?, ?);",
+                           (full_name, email, grade_level_text, username, password_hash))
+            teacher_id = cursor.lastrowid
+
+        for subject_name in subject_names:
+            cursor.execute("SELECT subject_id FROM subjects WHERE subject_name = ?;", (subject_name,))
+            srow = cursor.fetchone()
+            if srow:
+                for g in grade_levels:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_id, grade_level) VALUES (?, ?, ?);",
+                        (teacher_id, srow[0], g)
+                    )
+
+        conn.commit()
     return teacher_id
 
 
 def authenticate_teacher(username, password):
     """Verify teacher credentials."""
-    import hashlib
     if not username or not password:
         return None
     password_hash = hashlib.sha256(password.encode()).hexdigest()
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT teacher_id, full_name FROM teachers WHERE username = ? AND password_hash = ?;",
-                   (username, password_hash))
-    row = cursor.fetchone()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT teacher_id, full_name FROM teachers WHERE username = ? AND password_hash = ?;",
+                       (username, password_hash))
+        row = cursor.fetchone()
     return row if row else None
  
  
 def get_teachers_for_subject(subject_name, grade_level=None):
     """List teachers who teach a given subject."""
-    conn = get_conn()
-    cursor = conn.cursor()
-    if grade_level:
-        cursor.execute("""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        if grade_level:
+            cursor.execute("""
         SELECT DISTINCT t.teacher_id, t.full_name
         FROM teachers t
         JOIN teacher_subjects ts ON ts.teacher_id = t.teacher_id
@@ -694,8 +715,8 @@ def get_teachers_for_subject(subject_name, grade_level=None):
         WHERE s.subject_name = ? AND (ts.grade_level = ? OR ts.grade_level = '')
         ORDER BY t.full_name;
     """, (subject_name, grade_level))
-    else:
-        cursor.execute("""
+        else:
+            cursor.execute("""
         SELECT t.teacher_id, t.full_name
         FROM teachers t
         JOIN teacher_subjects ts ON ts.teacher_id = t.teacher_id
@@ -703,44 +724,40 @@ def get_teachers_for_subject(subject_name, grade_level=None):
         WHERE s.subject_name = ?
         ORDER BY t.full_name;
     """, (subject_name,))
-    rows = cursor.fetchall()
-    conn.close()
+        rows = cursor.fetchall()
     return rows  # list of (teacher_id, full_name)
  
  
 def submit_preference(student_id, subject_name, preferred_teacher_id=None, priority=1):
     """Record (or update) a student's subject + preferred teacher choice."""
-    conn = get_conn()
-    cursor = conn.cursor()
- 
-    cursor.execute("SELECT subject_id FROM subjects WHERE subject_name = ?;", (subject_name,))
-    row = cursor.fetchone()
-    if row is None:
-        conn.close()
-        return False, f"Subject '{subject_name}' not found."
-    subject_id = row[0]
- 
-    try:
-        cursor.execute("""
-            INSERT INTO student_preferences (student_id, subject_id, preferred_teacher_id, priority)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(student_id, subject_id, priority)
-            DO UPDATE SET preferred_teacher_id = excluded.preferred_teacher_id,
-                          submitted_at = CURRENT_TIMESTAMP;
-        """, (student_id, subject_id, preferred_teacher_id, priority))
-        conn.commit()
-        return True, "Preference saved."
-    except sqlite3.IntegrityError as exc:
-        return False, str(exc)
-    finally:
-        conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT subject_id FROM subjects WHERE subject_name = ?;", (subject_name,))
+        row = cursor.fetchone()
+        if row is None:
+            return False, f"Subject '{subject_name}' not found."
+        subject_id = row[0]
+
+        try:
+            cursor.execute("""
+                INSERT INTO student_preferences (student_id, subject_id, preferred_teacher_id, priority)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(student_id, subject_id, priority)
+                DO UPDATE SET preferred_teacher_id = excluded.preferred_teacher_id,
+                              submitted_at = CURRENT_TIMESTAMP;
+            """, (student_id, subject_id, preferred_teacher_id, priority))
+            conn.commit()
+            return True, "Preference saved."
+        except sqlite3.IntegrityError as exc:
+            return False, str(exc)
  
  
 def view_student_preferences(student_id):
     """Return all preferences for a student, in priority order."""
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
         SELECT sub.subject_name, t.full_name, sp.priority
         FROM student_preferences sp
         JOIN subjects sub ON sub.subject_id = sp.subject_id
@@ -748,16 +765,15 @@ def view_student_preferences(student_id):
         WHERE sp.student_id = ?
         ORDER BY sp.priority ASC;
     """, (student_id,))
-    rows = cursor.fetchall()
-    conn.close()
+        rows = cursor.fetchall()
     return rows  # list of (subject_name, teacher_name_or_None, priority)
  
  
 def get_preferences_for_teacher(teacher_id):
     """Which students picked this teacher, and for which subject."""
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
         SELECT s.full_name, s.roll_number, sub.subject_name, sp.priority
         FROM student_preferences sp
         JOIN students s ON s.student_id = sp.student_id
@@ -765,15 +781,14 @@ def get_preferences_for_teacher(teacher_id):
         WHERE sp.preferred_teacher_id = ?
         ORDER BY sub.subject_name, sp.priority;
     """, (teacher_id,))
-    rows = cursor.fetchall()
-    conn.close()
+        rows = cursor.fetchall()
     return rows
 
 
 def create_flashcards_table():
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS flashcards (
             flashcard_id INTEGER PRIMARY KEY AUTOINCREMENT,
             subject_name TEXT NOT NULL,
@@ -783,9 +798,8 @@ def create_flashcards_table():
             created_by TEXT DEFAULT 'teacher',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-    """)
-    conn.commit()
-    conn.close()
+        """)
+        conn.commit()
 
 
 def seed_flashcards():
@@ -826,47 +840,44 @@ def seed_flashcards():
             ("What is scarcity?", "A situation where limited resources cannot satisfy all wants."),
         ],
     }
-    conn = get_conn()
-    cursor = conn.cursor()
-    for subject_name, cards in default_cards.items():
-        for question, answer in cards:
-            cursor.execute(
-                "INSERT OR IGNORE INTO flashcards (subject_name, question_text, answer_text, created_by) VALUES (?, ?, ?, ?);",
-                (subject_name, question, answer, "system"),
-            )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        for subject_name, cards in default_cards.items():
+            for question, answer in cards:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO flashcards (subject_name, question_text, answer_text, created_by) VALUES (?, ?, ?, ?);",
+                    (subject_name, question, answer, "system"),
+                )
+        conn.commit()
 
 
 def add_flashcard(subject_name, question, answer, created_by="teacher", grade_level=None):
     if not subject_name or not question.strip() or not answer.strip():
         return False
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO flashcards (subject_name, grade_level, question_text, answer_text, created_by) VALUES (?, ?, ?, ?, ?);",
-        (subject_name.strip(), (grade_level or "").strip(), question.strip(), answer.strip(), created_by),
-    )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO flashcards (subject_name, grade_level, question_text, answer_text, created_by) VALUES (?, ?, ?, ?, ?);",
+            (subject_name.strip(), (grade_level or "").strip(), question.strip(), answer.strip(), created_by),
+        )
+        conn.commit()
     return True
 
 
 def get_flashcards_for_subject(subject_name, grade_level=None):
-    conn = get_conn()
-    cursor = conn.cursor()
-    if grade_level:
-        cursor.execute(
-            "SELECT flashcard_id, question_text, answer_text FROM flashcards WHERE subject_name = ? AND (grade_level = ? OR grade_level IS NULL OR grade_level = '') ORDER BY flashcard_id;",
-            (subject_name, grade_level),
-        )
-    else:
-        cursor.execute(
-            "SELECT flashcard_id, question_text, answer_text FROM flashcards WHERE subject_name = ? ORDER BY flashcard_id;",
-            (subject_name,),
-        )
-    rows = cursor.fetchall()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        if grade_level:
+            cursor.execute(
+                "SELECT flashcard_id, question_text, answer_text FROM flashcards WHERE subject_name = ? AND (grade_level = ? OR grade_level IS NULL OR grade_level = '') ORDER BY flashcard_id;",
+                (subject_name, grade_level),
+            )
+        else:
+            cursor.execute(
+                "SELECT flashcard_id, question_text, answer_text FROM flashcards WHERE subject_name = ? ORDER BY flashcard_id;",
+                (subject_name,),
+            )
+        rows = cursor.fetchall()
     return rows
 
 
@@ -874,37 +885,35 @@ def get_flashcards_for_subjects(subject_names, grade_level=None):
     if not subject_names:
         return []
     placeholders = ", ".join("?" for _ in subject_names)
-    conn = get_conn()
-    cursor = conn.cursor()
-    if grade_level:
-        cursor.execute(
-            f"SELECT flashcard_id, subject_name, question_text, answer_text FROM flashcards WHERE subject_name IN ({placeholders}) AND (grade_level = ? OR grade_level IS NULL OR grade_level = '') ORDER BY subject_name, flashcard_id;",
-            subject_names + [grade_level],
-        )
-    else:
-        cursor.execute(
-            f"SELECT flashcard_id, subject_name, question_text, answer_text FROM flashcards WHERE subject_name IN ({placeholders}) ORDER BY subject_name, flashcard_id;",
-            subject_names,
-        )
-    rows = cursor.fetchall()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        if grade_level:
+            cursor.execute(
+                f"SELECT flashcard_id, subject_name, question_text, answer_text FROM flashcards WHERE subject_name IN ({placeholders}) AND (grade_level = ? OR grade_level IS NULL OR grade_level = '') ORDER BY subject_name, flashcard_id;",
+                subject_names + [grade_level],
+            )
+        else:
+            cursor.execute(
+                f"SELECT flashcard_id, subject_name, question_text, answer_text FROM flashcards WHERE subject_name IN ({placeholders}) ORDER BY subject_name, flashcard_id;",
+                subject_names,
+            )
+        rows = cursor.fetchall()
     return rows
 
 
 def delete_flashcard(flashcard_id):
     """Delete a flashcard by ID."""
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM flashcards WHERE flashcard_id = ?;", (flashcard_id,))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM flashcards WHERE flashcard_id = ?;", (flashcard_id,))
+        conn.commit()
     return True
 
 
 def create_study_streaks_table():
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS study_streaks (
             streak_id INTEGER PRIMARY KEY AUTOINCREMENT,
             student_id INTEGER NOT NULL,
@@ -915,15 +924,14 @@ def create_study_streaks_table():
             UNIQUE (student_id, study_date),
             FOREIGN KEY (student_id) REFERENCES students(student_id) ON DELETE CASCADE
         );
-    """)
-    conn.commit()
-    conn.close()
+        """)
+        conn.commit()
 
 
 def create_textbooks_table():
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS textbooks (
             textbook_id INTEGER PRIMARY KEY AUTOINCREMENT,
             subject_name TEXT NOT NULL,
@@ -936,8 +944,8 @@ def create_textbooks_table():
             added_by TEXT DEFAULT 'admin',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-    """)
-    cursor.execute("""
+        """)
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS teacher_notes (
             note_id INTEGER PRIMARY KEY AUTOINCREMENT,
             subject_name TEXT NOT NULL,
@@ -948,8 +956,8 @@ def create_textbooks_table():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (teacher_id) REFERENCES teachers(teacher_id) ON DELETE SET NULL
         );
-    """)
-    cursor.execute("""
+        """)
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS past_papers (
             paper_id INTEGER PRIMARY KEY AUTOINCREMENT,
             subject_name TEXT NOT NULL,
@@ -964,8 +972,8 @@ def create_textbooks_table():
             duration_minutes INTEGER DEFAULT 60,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-    """)
-    cursor.execute("""
+        """)
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS syllabus_documents (
             syllabus_id INTEGER PRIMARY KEY AUTOINCREMENT,
             subject_name TEXT NOT NULL,
@@ -975,143 +983,133 @@ def create_textbooks_table():
             chapter_outline TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-    """)
-    conn.commit()
-    conn.close()
+        """)
+        conn.commit()
 
 
 def add_textbook(subject_name, title, author=None, description=None, resource_type='textbook', file_path=None, external_url=None, added_by='admin'):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """INSERT INTO textbooks (subject_name, title, author, description, resource_type, file_path, external_url, added_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?);""",
-        (subject_name, title, author, description, resource_type, file_path, external_url, added_by)
-    )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO textbooks (subject_name, title, author, description, resource_type, file_path, external_url, added_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?);""",
+            (subject_name, title, author, description, resource_type, file_path, external_url, added_by)
+        )
+        conn.commit()
     return True
 
 
 def get_textbooks_for_subject(subject_name):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT textbook_id, title, author, description, resource_type, file_path, external_url FROM textbooks WHERE subject_name = ? ORDER BY title;",
-        (subject_name,)
-    )
-    rows = cursor.fetchall()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT textbook_id, title, author, description, resource_type, file_path, external_url FROM textbooks WHERE subject_name = ? ORDER BY title;",
+            (subject_name,)
+        )
+        rows = cursor.fetchall()
     return rows
 
 
 def add_teacher_note(subject_name, teacher_id, title, content, chapter=None):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """INSERT INTO teacher_notes (subject_name, teacher_id, title, content, chapter)
-           VALUES (?, ?, ?, ?, ?);""",
-        (subject_name, teacher_id, title, content, chapter)
-    )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO teacher_notes (subject_name, teacher_id, title, content, chapter)
+               VALUES (?, ?, ?, ?, ?);""",
+            (subject_name, teacher_id, title, content, chapter)
+        )
+        conn.commit()
     return True
 
 
 def get_teacher_notes_for_subject(subject_name):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """SELECT note_id, title, content, chapter, created_at FROM teacher_notes
-           WHERE subject_name = ? ORDER BY created_at DESC;""",
-        (subject_name,)
-    )
-    rows = cursor.fetchall()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """SELECT note_id, title, content, chapter, created_at FROM teacher_notes
+               WHERE subject_name = ? ORDER BY created_at DESC;""",
+            (subject_name,)
+        )
+        rows = cursor.fetchall()
     return rows
 
 
 def add_past_paper(subject_name, year, paper_type, season, paper_number, question_paper_path=None, mark_scheme_path=None, examiner_report_path=None, grade_level=None, duration_minutes=60):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-          """INSERT INTO past_papers (subject_name, grade_level, year, paper_type, season, paper_number, question_paper_path, mark_scheme_path, examiner_report_path, duration_minutes)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
-          (subject_name, grade_level, year, paper_type, season, paper_number, question_paper_path, mark_scheme_path, examiner_report_path, int(duration_minutes or 60))
-    )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+              """INSERT INTO past_papers (subject_name, grade_level, year, paper_type, season, paper_number, question_paper_path, mark_scheme_path, examiner_report_path, duration_minutes)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
+              (subject_name, grade_level, year, paper_type, season, paper_number, question_paper_path, mark_scheme_path, examiner_report_path, int(duration_minutes or 60))
+        )
+        conn.commit()
     return True
 
 
 def get_past_papers_for_subject(subject_name, grade_level=None):
-    conn = get_conn()
-    cursor = conn.cursor()
-    if grade_level:
-        cursor.execute(
-            """SELECT paper_id, year, paper_type, season, paper_number, question_paper_path, mark_scheme_path, examiner_report_path, duration_minutes
-               FROM past_papers WHERE subject_name = ? AND (grade_level = ? OR grade_level IS NULL OR grade_level = '') ORDER BY year DESC, season DESC, paper_number;""",
-            (subject_name, grade_level)
-        )
-    else:
-        cursor.execute(
-            """SELECT paper_id, year, paper_type, season, paper_number, question_paper_path, mark_scheme_path, examiner_report_path, duration_minutes
-               FROM past_papers WHERE subject_name = ? ORDER BY year DESC, season DESC, paper_number;""",
-            (subject_name,)
-        )
-    rows = cursor.fetchall()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        if grade_level:
+            cursor.execute(
+                """SELECT paper_id, year, paper_type, season, paper_number, question_paper_path, mark_scheme_path, examiner_report_path, duration_minutes
+                   FROM past_papers WHERE subject_name = ? AND (grade_level = ? OR grade_level IS NULL OR grade_level = '') ORDER BY year DESC, season DESC, paper_number;""",
+                (subject_name, grade_level)
+            )
+        else:
+            cursor.execute(
+                """SELECT paper_id, year, paper_type, season, paper_number, question_paper_path, mark_scheme_path, examiner_report_path, duration_minutes
+                   FROM past_papers WHERE subject_name = ? ORDER BY year DESC, season DESC, paper_number;""",
+                (subject_name,)
+            )
+        rows = cursor.fetchall()
     return rows
 
 
 def add_syllabus_document(subject_name, grade_level, title, file_path=None, chapter_outline=None):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """INSERT INTO syllabus_documents (subject_name, grade_level, title, file_path, chapter_outline)
-           VALUES (?, ?, ?, ?, ?);""",
-        (subject_name, grade_level, title, file_path, chapter_outline),
-    )
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO syllabus_documents (subject_name, grade_level, title, file_path, chapter_outline)
+               VALUES (?, ?, ?, ?, ?);""",
+            (subject_name, grade_level, title, file_path, chapter_outline),
+        )
+        conn.commit()
     return True
 
 
 def get_syllabus_documents(subject_name, grade_level=None):
-    conn = get_conn()
-    cursor = conn.cursor()
-    if grade_level:
-        cursor.execute(
-            "SELECT syllabus_id, title, file_path, chapter_outline, created_at FROM syllabus_documents WHERE subject_name = ? AND (grade_level = ? OR grade_level IS NULL OR grade_level = '') ORDER BY created_at DESC;",
-            (subject_name, grade_level),
-        )
-    else:
-        cursor.execute(
-            "SELECT syllabus_id, title, file_path, chapter_outline, created_at FROM syllabus_documents WHERE subject_name = ? ORDER BY created_at DESC;",
-            (subject_name,),
-        )
-    rows = cursor.fetchall()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        if grade_level:
+            cursor.execute(
+                "SELECT syllabus_id, title, file_path, chapter_outline, created_at FROM syllabus_documents WHERE subject_name = ? AND (grade_level = ? OR grade_level IS NULL OR grade_level = '') ORDER BY created_at DESC;",
+                (subject_name, grade_level),
+            )
+        else:
+            cursor.execute(
+                "SELECT syllabus_id, title, file_path, chapter_outline, created_at FROM syllabus_documents WHERE subject_name = ? ORDER BY created_at DESC;",
+                (subject_name,),
+            )
+        rows = cursor.fetchall()
     return rows
 
 
 def get_teacher_pending_checks(teacher_id):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT s.submission_id, s.student_id, s.student_name, a.title, a.subject_name, a.total_marks,
-               s.answer_text, s.answer_file_path, s.submitted_at
-        FROM assessment_submissions s
-        JOIN assessments a ON a.assessment_id = s.assessment_id
-        WHERE s.status = 'submitted' AND (s.teacher_check_enabled = 1 OR s.grading_mode IN ('Teacher only', 'AI + teacher'))
-          AND (a.teacher_id IS NULL OR a.teacher_id = ?)
-        ORDER BY s.submitted_at DESC;
-        """,
-        (teacher_id,),
-    )
-    rows = cursor.fetchall()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT s.submission_id, s.student_id, s.student_name, a.title, a.subject_name, a.total_marks,
+                   s.answer_text, s.answer_file_path, s.submitted_at
+            FROM assessment_submissions s
+            JOIN assessments a ON a.assessment_id = s.assessment_id
+            WHERE s.status = 'submitted' AND (s.teacher_check_enabled = 1 OR s.grading_mode IN ('Teacher only', 'AI + teacher'))
+              AND (a.teacher_id IS NULL OR a.teacher_id = ?)
+            ORDER BY s.submitted_at DESC;
+            """,
+            (teacher_id,),
+        )
+        rows = cursor.fetchall()
     return rows
 
 
@@ -1121,22 +1119,20 @@ def record_study_session(student_id, minutes_studied=0, pomodoros_completed=0):
         return False
     from datetime import date
     today = date.today().isoformat()
-    conn = get_conn()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("""
-            INSERT INTO study_streaks (student_id, study_date, minutes_studied, pomodoros_completed)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(student_id, study_date)
-            DO UPDATE SET minutes_studied = minutes_studied + excluded.minutes_studied,
-                          pomodoros_completed = pomodoros_completed + excluded.pomodoros_completed;
-        """, (student_id, today, minutes_studied, pomodoros_completed))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO study_streaks (student_id, study_date, minutes_studied, pomodoros_completed)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(student_id, study_date)
+                DO UPDATE SET minutes_studied = minutes_studied + excluded.minutes_studied,
+                              pomodoros_completed = pomodoros_completed + excluded.pomodoros_completed;
+            """, (student_id, today, minutes_studied, pomodoros_completed))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
 
 def get_student_streak(student_id):
@@ -1144,16 +1140,15 @@ def get_student_streak(student_id):
     if not student_id:
         return {"current_streak": 0, "total_days": 0, "total_pomodoros": 0, "total_minutes": 0}
     
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT study_date, minutes_studied, pomodoros_completed
-        FROM study_streaks
-        WHERE student_id = ?
-        ORDER BY study_date DESC;
-    """, (student_id,))
-    rows = cursor.fetchall()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT study_date, minutes_studied, pomodoros_completed
+            FROM study_streaks
+            WHERE student_id = ?
+            ORDER BY study_date DESC;
+        """, (student_id,))
+        rows = cursor.fetchall()
     
     if not rows:
         return {"current_streak": 0, "total_days": 0, "total_pomodoros": 0, "total_minutes": 0}
@@ -1182,9 +1177,9 @@ def get_student_streak(student_id):
 
 
 def create_assessment_tables():
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS assessments (
             assessment_id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
@@ -1199,8 +1194,8 @@ def create_assessment_tables():
             teacher_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-    """)
-    cursor.execute("""
+        """)
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS assessment_submissions (
             submission_id INTEGER PRIMARY KEY AUTOINCREMENT,
             assessment_id INTEGER NOT NULL,
@@ -1222,9 +1217,8 @@ def create_assessment_tables():
             submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (assessment_id) REFERENCES assessments(assessment_id) ON DELETE CASCADE
         );
-    """)
-    conn.commit()
-    conn.close()
+        """)
+        conn.commit()
 
 
 def save_uploaded_file(uploaded_file, subdir, prefix):
@@ -1246,109 +1240,102 @@ def create_assessment(title, subject_name, total_marks, grade_level, description
         return None
     question_paper_path = save_uploaded_file(question_paper_file, "assessments", "paper")
     mark_scheme_path = save_uploaded_file(mark_scheme_file, "assessments", "scheme")
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO assessments (title, subject_name, total_marks, grade_level, exam_duration_minutes, description, question_paper_path, mark_scheme_path, examiner_report, teacher_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        (title.strip(), subject_name, total_marks, grade_level.strip() if grade_level else None, int(exam_duration_minutes or 60), description.strip() if description else None, question_paper_path, mark_scheme_path, examiner_report_text.strip() if examiner_report_text else None, teacher_id),
-    )
-    assessment_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO assessments (title, subject_name, total_marks, grade_level, exam_duration_minutes, description, question_paper_path, mark_scheme_path, examiner_report, teacher_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (title.strip(), subject_name, total_marks, grade_level.strip() if grade_level else None, int(exam_duration_minutes or 60), description.strip() if description else None, question_paper_path, mark_scheme_path, examiner_report_text.strip() if examiner_report_text else None, teacher_id),
+        )
+        assessment_id = cursor.lastrowid
+        conn.commit()
     return assessment_id
 
 
 def get_assessments_for_subject(subject_name, grade_level=None):
-    conn = get_conn()
-    cursor = conn.cursor()
-    if grade_level:
-        cursor.execute(
-            "SELECT assessment_id, title, subject_name, total_marks, grade_level, exam_duration_minutes, description, question_paper_path, mark_scheme_path, examiner_report, created_at FROM assessments WHERE subject_name = ? AND (grade_level = ? OR grade_level IS NULL OR grade_level = '') ORDER BY created_at DESC;",
-            (subject_name, grade_level),
-        )
-    else:
-        cursor.execute(
-            "SELECT assessment_id, title, subject_name, total_marks, grade_level, exam_duration_minutes, description, question_paper_path, mark_scheme_path, examiner_report, created_at FROM assessments WHERE subject_name = ? ORDER BY created_at DESC;",
-            (subject_name,),
-        )
-    rows = cursor.fetchall()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        if grade_level:
+            cursor.execute(
+                "SELECT assessment_id, title, subject_name, total_marks, grade_level, exam_duration_minutes, description, question_paper_path, mark_scheme_path, examiner_report, created_at FROM assessments WHERE subject_name = ? AND (grade_level = ? OR grade_level IS NULL OR grade_level = '') ORDER BY created_at DESC;",
+                (subject_name, grade_level),
+            )
+        else:
+            cursor.execute(
+                "SELECT assessment_id, title, subject_name, total_marks, grade_level, exam_duration_minutes, description, question_paper_path, mark_scheme_path, examiner_report, created_at FROM assessments WHERE subject_name = ? ORDER BY created_at DESC;",
+                (subject_name,),
+            )
+        rows = cursor.fetchall()
     return rows
 
 
 def save_assessment_submission(assessment_id, student_id, student_name, answer_text, grading_mode, completed_in_time=True, answer_file_path=None, self_check=False, teacher_check=False, ai_check=False):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO assessment_submissions (assessment_id, student_id, student_name, answer_text, grading_mode, completed_in_time, answer_file_path, self_check_enabled, teacher_check_enabled, ai_check_enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        (assessment_id, student_id, student_name, answer_text.strip(), grading_mode, 1 if completed_in_time else 0, answer_file_path, 1 if self_check else 0, 1 if teacher_check else 0, 1 if ai_check else 0),
-    )
-    submission_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO assessment_submissions (assessment_id, student_id, student_name, answer_text, grading_mode, completed_in_time, answer_file_path, self_check_enabled, teacher_check_enabled, ai_check_enabled)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (assessment_id, student_id, student_name, answer_text.strip(), grading_mode, 1 if completed_in_time else 0, answer_file_path, 1 if self_check else 0, 1 if teacher_check else 0, 1 if ai_check else 0),
+        )
+        submission_id = cursor.lastrowid
+        conn.commit()
     return submission_id
 
 
 def update_submission_grade(submission_id, teacher_score=None, teacher_feedback=None, ai_score=None, ai_feedback=None, status="graded"):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT ai_score, teacher_score FROM assessment_submissions WHERE submission_id = ?;",
-        (submission_id,),
-    )
-    existing = cursor.fetchone()
-    if existing is None:
-        conn.close()
-        return False
-    ai_score = ai_score if ai_score is not None else existing[0]
-    teacher_score = teacher_score if teacher_score is not None else existing[1]
-    final_score = None
-    if ai_score is not None and teacher_score is not None:
-        final_score = round((ai_score + teacher_score) / 2, 1)
-    elif ai_score is not None:
-        final_score = ai_score
-    elif teacher_score is not None:
-        final_score = teacher_score
-    cursor.execute(
-        """
-        UPDATE assessment_submissions
-        SET ai_score = ?, teacher_score = ?, final_score = ?, ai_feedback = COALESCE(?, ai_feedback), teacher_feedback = COALESCE(?, teacher_feedback), status = ?
-        WHERE submission_id = ?;
-        """,
-        (ai_score, teacher_score, final_score, ai_feedback, teacher_feedback, status, submission_id),
-    )
-    conn.commit()
-    conn.close()
-    return True
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT ai_score, teacher_score FROM assessment_submissions WHERE submission_id = ?;",
+            (submission_id,),
+        )
+        existing = cursor.fetchone()
+        if existing is None:
+            return False
+        ai_score = ai_score if ai_score is not None else existing[0]
+        teacher_score = teacher_score if teacher_score is not None else existing[1]
+        final_score = None
+        if ai_score is not None and teacher_score is not None:
+            final_score = round((ai_score + teacher_score) / 2, 1)
+        elif ai_score is not None:
+            final_score = ai_score
+        elif teacher_score is not None:
+            final_score = teacher_score
+        cursor.execute(
+            """
+            UPDATE assessment_submissions
+            SET ai_score = ?, teacher_score = ?, final_score = ?, ai_feedback = COALESCE(?, ai_feedback), teacher_feedback = COALESCE(?, teacher_feedback), status = ?
+            WHERE submission_id = ?;
+            """,
+            (ai_score, teacher_score, final_score, ai_feedback, teacher_feedback, status, submission_id),
+        )
+        conn.commit()
+        return True
 
 
 def get_submissions_for_assessment(assessment_id):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT submission_id, student_id, student_name, answer_text, grading_mode, ai_score, teacher_score, final_score, status, completed_in_time, answer_file_path, self_check_enabled, teacher_check_enabled, ai_check_enabled, ai_feedback, teacher_feedback, submitted_at FROM assessment_submissions WHERE assessment_id = ? ORDER BY submitted_at DESC;",
-        (assessment_id,),
-    )
-    rows = cursor.fetchall()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT submission_id, student_id, student_name, answer_text, grading_mode, ai_score, teacher_score, final_score, status, completed_in_time, answer_file_path, self_check_enabled, teacher_check_enabled, ai_check_enabled, ai_feedback, teacher_feedback, submitted_at FROM assessment_submissions WHERE assessment_id = ? ORDER BY submitted_at DESC;",
+            (assessment_id,),
+        )
+        rows = cursor.fetchall()
     return rows
 
 
 def get_submissions_for_student(student_id):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT s.submission_id, s.assessment_id, a.title, a.subject_name, a.total_marks, s.grading_mode, s.ai_score, s.teacher_score, s.final_score, s.status, s.completed_in_time, s.ai_feedback, s.teacher_feedback, s.submitted_at FROM assessment_submissions s JOIN assessments a ON a.assessment_id = s.assessment_id WHERE s.student_id = ? ORDER BY s.submitted_at DESC;",
-        (student_id,),
-    )
-    rows = cursor.fetchall()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT s.submission_id, s.assessment_id, a.title, a.subject_name, a.total_marks, s.grading_mode, s.ai_score, s.teacher_score, s.final_score, s.status, s.completed_in_time, s.ai_feedback, s.teacher_feedback, s.submitted_at FROM assessment_submissions s JOIN assessments a ON a.assessment_id = s.assessment_id WHERE s.student_id = ? ORDER BY s.submitted_at DESC;",
+            (student_id,),
+        )
+        rows = cursor.fetchall()
     return rows
 
 
@@ -1377,20 +1364,18 @@ def get_performance_recommendation(percentage, feedback=None):
 
 
 def get_student_threshold(student_id):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT performance_threshold FROM students WHERE student_id = ?;", (student_id,))
-    row = cursor.fetchone()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT performance_threshold FROM students WHERE student_id = ?;", (student_id,))
+        row = cursor.fetchone()
     return int(row[0]) if row and row[0] is not None else DEFAULT_PERFORMANCE_THRESHOLD
 
 
 def update_student_threshold(student_id, threshold):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE students SET performance_threshold = ? WHERE student_id = ?;", (int(threshold), student_id))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE students SET performance_threshold = ? WHERE student_id = ?;", (int(threshold), student_id))
+        conn.commit()
     return True
 
 
