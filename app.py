@@ -6,7 +6,7 @@ import uuid
 import sqlite3
 import hashlib
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
  
 import streamlit as st
 
@@ -14,55 +14,149 @@ from dotenv import load_dotenv
 from groq import Groq
 
 
-DAILY_AI_QUOTA = 5
+DAILY_AI_QUOTA = 10
+PAYMENT_LINK = os.environ.get("SCHOLARWAVE_PAYMENT_LINK", "https://buy.stripe.com/mock_link")
+PAYMENT_CONTACT_EMAIL = os.environ.get("SCHOLARWAVE_PAYMENT_CONTACT_EMAIL", "billing@scholarwavehub.com")
+PAYMENT_CONTACT_PHONE = os.environ.get("SCHOLARWAVE_PAYMENT_CONTACT_PHONE", "+880-000-000000")
+PREMIUM_DAYS_DEFAULT = int(os.environ.get("SCHOLARWAVE_PREMIUM_DAYS", "30"))
 
 
 def _current_quota_date():
     return datetime.now().date().isoformat()
 
 
-def _get_ai_usage_bucket(role=None):
+def _resolve_ai_usage_identity(role=None):
     active_role = role or st.session_state.get("role") or "Student"
-    usage = st.session_state.setdefault("ai_questions_asked_by_role", {})
-    bucket = usage.get(active_role)
+    if active_role == "Student" and st.session_state.get("student_id"):
+        return active_role, f"student:{st.session_state.get('student_id')}"
+    if active_role == "Teacher" and st.session_state.get("teacher_id"):
+        return active_role, f"teacher:{st.session_state.get('teacher_id')}"
 
-    today = _current_quota_date()
-    if not isinstance(bucket, dict) or bucket.get("date") != today:
-        bucket = {"date": today, "count": 0}
-        usage[active_role] = bucket
+    if "anonymous_ai_session_id" not in st.session_state:
+        st.session_state["anonymous_ai_session_id"] = uuid.uuid4().hex[:12]
+    return active_role, f"session:{st.session_state['anonymous_ai_session_id']}"
 
-    # Keep a simple compatibility key for the current active role.
-    st.session_state["ai_questions_asked"] = int(bucket.get("count", 0))
 
-    return active_role, bucket
+def _today_date():
+    return datetime.now().date()
+
+
+def _parse_iso_date(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def is_user_premium(role=None):
+    active_role = role or st.session_state.get("role") or "Student"
+    if active_role == "Student":
+        sid = st.session_state.get("student_id")
+        if not sid:
+            return False
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT premium_until FROM students WHERE student_id = ?;", (sid,))
+            row = cursor.fetchone()
+    else:
+        tid = st.session_state.get("teacher_id")
+        if not tid:
+            return False
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT premium_until FROM teachers WHERE teacher_id = ?;", (tid,))
+            row = cursor.fetchone()
+
+    premium_until = _parse_iso_date(row[0]) if row else None
+    return bool(premium_until and premium_until >= _today_date())
+
+
+def get_user_premium_until(role=None):
+    active_role = role or st.session_state.get("role") or "Student"
+    if active_role == "Student":
+        sid = st.session_state.get("student_id")
+        if not sid:
+            return None
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT premium_until FROM students WHERE student_id = ?;", (sid,))
+            row = cursor.fetchone()
+    else:
+        tid = st.session_state.get("teacher_id")
+        if not tid:
+            return None
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT premium_until FROM teachers WHERE teacher_id = ?;", (tid,))
+            row = cursor.fetchone()
+
+    return _parse_iso_date(row[0]) if row else None
 
 
 def get_ai_usage_count(role=None):
-    _, bucket = _get_ai_usage_bucket(role=role)
-    return int(bucket.get("count", 0))
+    active_role, user_identifier = _resolve_ai_usage_identity(role=role)
+    usage_date = _current_quota_date()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT questions_asked FROM user_ai_usage WHERE user_role = ? AND user_identifier = ? AND usage_date = ?;",
+            (active_role, user_identifier, usage_date),
+        )
+        row = cursor.fetchone()
+    count = int(row[0]) if row else 0
+    st.session_state["ai_questions_asked"] = count
+    return count
 
 
 def check_ai_quota(role=None, show_paywall=True):
-    active_role, bucket = _get_ai_usage_bucket(role=role)
-    if int(bucket.get("count", 0)) >= DAILY_AI_QUOTA:
+    active_role = role or st.session_state.get("role") or "Student"
+    if is_user_premium(active_role):
+        return True
+    used = get_ai_usage_count(role=active_role)
+    if used >= DAILY_AI_QUOTA:
         if show_paywall:
-            st.error("⚠️ You have reached your limit of 5 free AI queries for today!")
+            st.error("⚠️ You have reached your limit of 10 free AI queries for today!")
             col1, col2 = st.columns([2, 1.5])
             with col1:
                 st.subheader("💳 Upgrade to ScholarWave Premium")
                 st.write("Get unlimited AI questions, essay grading, and advanced cheat sheets for just $2/month.")
-                st.link_button("🚀 Unlock Unlimited Access", "https://buy.stripe.com/mock_link")
+                st.link_button("🚀 Unlock Unlimited Access", PAYMENT_LINK)
             with col2:
                 st.info("💡 Premium benefits unlock instant server response speeds and personalized O-Level study feedback loops.")
-            st.caption(f"Role: {active_role} · Usage today: {bucket.get('count', 0)}/{DAILY_AI_QUOTA}")
+            st.caption(f"Role: {active_role} · Usage today: {used}/{DAILY_AI_QUOTA}")
+            st.caption(f"Need help paying? Contact us at {PAYMENT_CONTACT_EMAIL} or {PAYMENT_CONTACT_PHONE}")
         return False
     return True
 
 
 def increment_ai_quota(role=None):
-    _, bucket = _get_ai_usage_bucket(role=role)
-    bucket["count"] = int(bucket.get("count", 0)) + 1
-    return bucket["count"]
+    active_role, user_identifier = _resolve_ai_usage_identity(role=role)
+    usage_date = _current_quota_date()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO user_ai_usage (user_role, user_identifier, usage_date, questions_asked)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(user_role, user_identifier, usage_date)
+            DO UPDATE SET questions_asked = questions_asked + 1, updated_at = CURRENT_TIMESTAMP;
+            """,
+            (active_role, user_identifier, usage_date),
+        )
+        cursor.execute(
+            "SELECT questions_asked FROM user_ai_usage WHERE user_role = ? AND user_identifier = ? AND usage_date = ?;",
+            (active_role, user_identifier, usage_date),
+        )
+        row = cursor.fetchone()
+        conn.commit()
+    count = int(row[0]) if row else 0
+    st.session_state["ai_questions_asked"] = count
+    return count
  
 load_dotenv()
  
@@ -255,7 +349,7 @@ def _call(model, prompt, system, max_tokens=700):
         return {
             "ok": False,
             "text": (
-                "⚠️ You have reached your limit of 5 free AI queries for today. "
+                "⚠️ You have reached your limit of 10 free AI queries for today. "
                 "Please upgrade to continue using unlimited AI features."
             ),
         }
@@ -470,8 +564,22 @@ def create_tables():
             roll_number TEXT UNIQUE NOT NULL,
             grade_level TEXT,
             email TEXT,
+            password_hash TEXT,
+            premium_until TEXT,
             performance_threshold INTEGER DEFAULT 60,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_ai_usage (
+            usage_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_role TEXT NOT NULL,
+            user_identifier TEXT NOT NULL,
+            usage_date TEXT NOT NULL,
+            questions_asked INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (user_role, user_identifier, usage_date)
         );
         """)
  
@@ -491,7 +599,8 @@ def create_tables():
             grade_level TEXT,
             max_students INTEGER DEFAULT 30,
             username TEXT UNIQUE,
-            password_hash TEXT
+            password_hash TEXT,
+            premium_until TEXT
         );
         """)
  
@@ -521,6 +630,35 @@ def create_tables():
         );
         """)
 
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS suggestions (
+            suggestion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_role TEXT,
+            user_name TEXT,
+            user_email TEXT,
+            category TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS payment_requests (
+            request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_role TEXT,
+            user_identifier TEXT,
+            user_name TEXT,
+            user_email TEXT,
+            reference TEXT,
+            note TEXT,
+            status TEXT DEFAULT 'pending',
+            reviewed_by TEXT,
+            reviewed_note TEXT,
+            reviewed_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+
         conn.commit()
     ensure_profile_columns()
 
@@ -529,10 +667,13 @@ def ensure_profile_columns():
     with get_conn() as conn:
         cursor = conn.cursor()
         for statement in [
+            "ALTER TABLE students ADD COLUMN password_hash TEXT",
+            "ALTER TABLE students ADD COLUMN premium_until TEXT",
             "ALTER TABLE students ADD COLUMN performance_threshold INTEGER DEFAULT 60",
             "ALTER TABLE teachers ADD COLUMN grade_level TEXT",
             "ALTER TABLE teachers ADD COLUMN username TEXT",
             "ALTER TABLE teachers ADD COLUMN password_hash TEXT",
+            "ALTER TABLE teachers ADD COLUMN premium_until TEXT",
             "ALTER TABLE teacher_subjects ADD COLUMN grade_level TEXT DEFAULT ''",
             "ALTER TABLE flashcards ADD COLUMN grade_level TEXT",
             "ALTER TABLE syllabus_chapters ADD COLUMN grade_level TEXT DEFAULT ''",
@@ -545,6 +686,10 @@ def ensure_profile_columns():
             "ALTER TABLE assessment_submissions ADD COLUMN self_check_enabled INTEGER DEFAULT 0",
             "ALTER TABLE assessment_submissions ADD COLUMN teacher_check_enabled INTEGER DEFAULT 0",
             "ALTER TABLE assessment_submissions ADD COLUMN ai_check_enabled INTEGER DEFAULT 0",
+            "ALTER TABLE payment_requests ADD COLUMN user_identifier TEXT",
+            "ALTER TABLE payment_requests ADD COLUMN reviewed_by TEXT",
+            "ALTER TABLE payment_requests ADD COLUMN reviewed_note TEXT",
+            "ALTER TABLE payment_requests ADD COLUMN reviewed_at TIMESTAMP",
         ]:
             try:
                 cursor.execute(statement)
@@ -700,6 +845,209 @@ def get_teacher_questions(teacher_id):
     """, (teacher_id,))
         rows = cursor.fetchall()
     return rows
+
+
+def save_suggestion(user_role, user_name, user_email, category, message):
+    if not category or not message.strip():
+        return False
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO suggestions (user_role, user_name, user_email, category, message) VALUES (?, ?, ?, ?, ?);",
+            (user_role, user_name, user_email, category, message.strip()),
+        )
+        conn.commit()
+    return True
+
+
+def get_recent_suggestions(limit=50):
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT suggestion_id, user_role, user_name, user_email, category, message, created_at FROM suggestions ORDER BY created_at DESC LIMIT ?;",
+            (int(limit),),
+        )
+        rows = cursor.fetchall()
+    return rows
+
+
+def save_payment_request(user_role, user_identifier, user_name, user_email, reference, note):
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO payment_requests (user_role, user_identifier, user_name, user_email, reference, note) VALUES (?, ?, ?, ?, ?, ?);",
+            (user_role, user_identifier, user_name, user_email, (reference or "").strip(), (note or "").strip()),
+        )
+        conn.commit()
+    return True
+
+
+def get_payment_requests(limit=50):
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT request_id, user_role, user_identifier, user_name, user_email, reference, note, status, reviewed_by, reviewed_note, reviewed_at, created_at FROM payment_requests ORDER BY created_at DESC LIMIT ?;",
+            (int(limit),),
+        )
+        rows = cursor.fetchall()
+    return rows
+
+
+def update_payment_request_status(request_id, status, reviewed_by=None, reviewed_note=None):
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE payment_requests
+            SET status = ?, reviewed_by = ?, reviewed_note = ?, reviewed_at = CURRENT_TIMESTAMP
+            WHERE request_id = ?;
+            """,
+            (status, reviewed_by, reviewed_note, request_id),
+        )
+        conn.commit()
+    return True
+
+
+def grant_premium_access(user_role, user_identifier=None, user_email=None, days=PREMIUM_DAYS_DEFAULT):
+    duration = max(int(days or PREMIUM_DAYS_DEFAULT), 1)
+    today = _today_date()
+    target_date = today + timedelta(days=duration)
+
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        if user_role == "Student":
+            student_id = None
+            if user_identifier and str(user_identifier).startswith("student:"):
+                try:
+                    student_id = int(str(user_identifier).split(":", 1)[1])
+                except ValueError:
+                    student_id = None
+            if student_id is None and user_email:
+                cursor.execute("SELECT student_id FROM students WHERE email = ? ORDER BY student_id DESC LIMIT 1;", (user_email,))
+                row = cursor.fetchone()
+                student_id = row[0] if row else None
+            if student_id is None:
+                return False, "Student account not found."
+
+            cursor.execute("SELECT premium_until FROM students WHERE student_id = ?;", (student_id,))
+            row = cursor.fetchone()
+            current_until = _parse_iso_date(row[0]) if row else None
+            base_date = current_until if current_until and current_until > today else today
+            new_until = base_date + timedelta(days=duration)
+            cursor.execute("UPDATE students SET premium_until = ? WHERE student_id = ?;", (new_until.isoformat(), student_id))
+        else:
+            teacher_id = None
+            if user_identifier and str(user_identifier).startswith("teacher:"):
+                try:
+                    teacher_id = int(str(user_identifier).split(":", 1)[1])
+                except ValueError:
+                    teacher_id = None
+            if teacher_id is None and user_email:
+                cursor.execute("SELECT teacher_id FROM teachers WHERE email = ? ORDER BY teacher_id DESC LIMIT 1;", (user_email,))
+                row = cursor.fetchone()
+                teacher_id = row[0] if row else None
+            if teacher_id is None:
+                return False, "Teacher account not found."
+
+            cursor.execute("SELECT premium_until FROM teachers WHERE teacher_id = ?;", (teacher_id,))
+            row = cursor.fetchone()
+            current_until = _parse_iso_date(row[0]) if row else None
+            base_date = current_until if current_until and current_until > today else today
+            new_until = base_date + timedelta(days=duration)
+            cursor.execute("UPDATE teachers SET premium_until = ? WHERE teacher_id = ?;", (new_until.isoformat(), teacher_id))
+
+        conn.commit()
+    return True, f"Premium active until {new_until.isoformat()}"
+
+
+def _current_user_profile():
+    role = st.session_state.get("role") or "Student"
+    if role == "Teacher":
+        teacher_id = st.session_state.get("teacher_id")
+        if teacher_id:
+            profile = get_teacher_profile(teacher_id)
+            if profile:
+                return role, f"teacher:{teacher_id}", profile[1], profile[2] or ""
+        return role, None, st.session_state.get("teacher_name", "Teacher"), ""
+
+    student_id = st.session_state.get("student_id")
+    if student_id:
+        row = get_student_by_id(student_id)
+        if row:
+            return role, f"student:{student_id}", row[1], row[4] or ""
+    return role, None, st.session_state.get("student_name", "Student"), ""
+
+
+def _render_corner_suggestion_box():
+    st.markdown(
+        """
+        <style>
+        .sw-corner-feedback {
+            position: fixed;
+            right: 18px;
+            bottom: 18px;
+            z-index: 9999;
+            width: 320px;
+            max-width: calc(100vw - 30px);
+            border-radius: 14px;
+            border: 1px solid #d8e7f2;
+            background: #ffffff;
+            box-shadow: 0 14px 28px rgba(0,0,0,.16);
+            padding: .75rem .85rem;
+        }
+        .sw-corner-feedback h4 {
+            margin: 0 0 .35rem;
+            color: #0f4f73;
+            font-size: .96rem;
+        }
+        .sw-corner-feedback p {
+            margin: 0;
+            color: #2e3d4f;
+            font-size: .82rem;
+            line-height: 1.25;
+        }
+        </style>
+        <div class="sw-corner-feedback">
+            <h4>💬 Suggestion Corner</h4>
+            <p>Have an idea, complaint, or improvement? Open the <b>Feedback & Payments</b> panel in the sidebar and send it in 30 seconds.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_feedback_and_payment_panel():
+    role, user_identifier, name, email = _current_user_profile()
+    with st.sidebar.expander("💬 Feedback & Payments", expanded=False):
+        st.caption("Share suggestions, complaints, and payment details.")
+
+        with st.form("feedback_form", clear_on_submit=True):
+            category = st.selectbox("Type", ["Suggestion", "Improvement", "Complaint", "Bug report"])
+            message = st.text_area("Your feedback", height=110, placeholder="Tell us what to improve…")
+            submitted_feedback = st.form_submit_button("Send feedback", type="primary")
+            if submitted_feedback:
+                if not message.strip():
+                    st.warning("Please write your feedback first.")
+                else:
+                    save_suggestion(role, name, email, category, message)
+                    st.success("Thanks. Your feedback was saved.")
+
+        st.divider()
+        st.markdown("**💳 Premium payment**")
+        st.write("Use the secure payment link below. After payment, submit your reference so we can activate your premium access.")
+        st.link_button("Pay for Premium", PAYMENT_LINK)
+        st.caption(f"Support contact: {PAYMENT_CONTACT_EMAIL} · {PAYMENT_CONTACT_PHONE}")
+
+        with st.form("payment_request_form", clear_on_submit=True):
+            reference = st.text_input("Payment reference / transaction ID")
+            note = st.text_area("Optional note", height=80, placeholder="e.g. Paid for Student account roll 2026005")
+            submitted_payment = st.form_submit_button("I have paid", type="primary")
+            if submitted_payment:
+                if not reference.strip():
+                    st.warning("Please add a transaction reference so we can verify your payment.")
+                else:
+                    save_payment_request(role, user_identifier, name, email, reference, note)
+                    st.success("Payment request received. We will verify and activate soon.")
  
  
 def get_student_by_roll(roll_number):
@@ -709,6 +1057,21 @@ def get_student_by_roll(roll_number):
                        (roll_number,))
         row = cursor.fetchone()
     return row  # (student_id, full_name, grade_level, email) or None
+
+
+def authenticate_student(roll_number, password):
+    """Verify student credentials (roll number + password)."""
+    if not roll_number or not password:
+        return None
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT student_id, full_name, grade_level, email FROM students WHERE roll_number = ? AND password_hash = ?;",
+            (roll_number, password_hash),
+        )
+        row = cursor.fetchone()
+    return row if row else None
  
  
 def get_student_by_id(student_id):
@@ -720,13 +1083,17 @@ def get_student_by_id(student_id):
     return row  # (student_id, full_name, roll_number, grade_level, email) or None
  
  
-def register_student(full_name, roll_number, grade_level, email):
+def register_student(full_name, roll_number, grade_level, email, password):
     """Add a new student with an auto-generated roll number.
 
     Roll format is YYYYNNN, where NNN is the registration sequence for that year.
     Returns (student_id, roll_number) on success, or (None, None) on failure.
     """
+    if not password:
+        return None, None
+
     current_year = datetime.now().year
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
 
     with get_conn() as conn:
         cursor = conn.cursor()
@@ -742,8 +1109,8 @@ def register_student(full_name, roll_number, grade_level, email):
 
             try:
                 cursor.execute(
-                    "INSERT INTO students (full_name, roll_number, grade_level, email) VALUES (?, ?, ?, ?);",
-                    (full_name, next_roll, grade_level, email)
+                    "INSERT INTO students (full_name, roll_number, grade_level, email, password_hash) VALUES (?, ?, ?, ?, ?);",
+                    (full_name, next_roll, grade_level, email, password_hash)
                 )
                 conn.commit()
                 return cursor.lastrowid, next_roll
@@ -755,7 +1122,7 @@ def register_student(full_name, roll_number, grade_level, email):
     return None, None
  
  
-def register_teacher_for_subjects(full_name, email, subject_names, grade_level=None, username=None, password=None):
+def register_teacher_for_subjects(full_name, email, subject_names, grade_level=None, username=None, password=None, teacher_id=None):
     """Create the teacher if needed, then link them to each chosen subject."""
     grade_levels = []
     if isinstance(grade_level, list):
@@ -769,8 +1136,13 @@ def register_teacher_for_subjects(full_name, email, subject_names, grade_level=N
     with get_conn() as conn:
         cursor = conn.cursor()
 
-        cursor.execute("SELECT teacher_id FROM teachers WHERE full_name = ?;", (full_name,))
-        row = cursor.fetchone()
+        row = None
+        if teacher_id:
+            cursor.execute("SELECT teacher_id FROM teachers WHERE teacher_id = ?;", (teacher_id,))
+            row = cursor.fetchone()
+        if row is None:
+            cursor.execute("SELECT teacher_id FROM teachers WHERE full_name = ?;", (full_name,))
+            row = cursor.fetchone()
         if row:
             teacher_id = row[0]
             cursor.execute("UPDATE teachers SET email = ?, grade_level = ? WHERE teacher_id = ?;",
@@ -785,6 +1157,7 @@ def register_teacher_for_subjects(full_name, email, subject_names, grade_level=N
                            (full_name, email, grade_level_text, username, password_hash))
             teacher_id = cursor.lastrowid
 
+        cursor.execute("DELETE FROM teacher_subjects WHERE teacher_id = ?;", (teacher_id,))
         for subject_name in subject_names:
             cursor.execute("SELECT subject_id FROM subjects WHERE subject_name = ?;", (subject_name,))
             srow = cursor.fetchone()
@@ -797,6 +1170,34 @@ def register_teacher_for_subjects(full_name, email, subject_names, grade_level=N
 
         conn.commit()
     return teacher_id
+
+
+def get_teacher_profile(teacher_id):
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT teacher_id, full_name, email, grade_level FROM teachers WHERE teacher_id = ?;",
+            (teacher_id,),
+        )
+        row = cursor.fetchone()
+    return row
+
+
+def get_teacher_subject_links(teacher_id):
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT s.subject_name, ts.grade_level
+            FROM teacher_subjects ts
+            JOIN subjects s ON s.subject_id = ts.subject_id
+            WHERE ts.teacher_id = ?
+            ORDER BY s.subject_name;
+            """,
+            (teacher_id,),
+        )
+        rows = cursor.fetchall()
+    return rows
 
 
 def authenticate_teacher(username, password):
@@ -1669,11 +2070,20 @@ def _render_org_header():
     st.markdown(_ORG_HEADER_CSS, unsafe_allow_html=True)
     st.markdown(
         """<div class="sharks-header">
-        <div class="eyebrow">✨ Cambridge Study Platform</div>
+        <div class="eyebrow">✨ KG to A-Level Learning Platform</div>
         <h1>🌊 ScholarWave Learning Hub</h1>
-        <p>Your comprehensive Cambridge study platform for both school and private students. Connect with expert teachers, access AI-powered tutoring, and excel in your Cambridge examinations.</p>
+        <p>Your all-in-one study platform for KG to Class 8, O-Level/IGCSE, and A-Level learners. Connect with expert teachers, access AI-powered tutoring, and build stronger exam confidence.</p>
         </div>""",
         unsafe_allow_html=True,
+    )
+
+
+def _render_seo_keywords_footer():
+    st.markdown("---")
+    st.caption(
+        "Curriculum search keywords: Cambridge Assessment International Education (CAIE), "
+        "Cambridge O-Level, IGCSE, A-Level, O Level Computer Science checklist, "
+        "IGCSE Accounting flashcards, Cambridge revision notes, Cambridge past papers."
     )
 
 
@@ -2071,7 +2481,7 @@ def teacher_view(model):
             st.session_state.pop(key, None)
         st.rerun()
 
-    tab_profile, tab_upload, tab_flashcards, tab_assessments, tab_to_check, tab_resources, tab_questions = st.tabs([
+    tab_profile, tab_upload, tab_flashcards, tab_assessments, tab_to_check, tab_resources, tab_questions, tab_feedback = st.tabs([
         "🏫 My classes & subjects",
         "📤 Upload lecture",
         "🧠 Manage flashcards",
@@ -2079,21 +2489,37 @@ def teacher_view(model):
         "✅ To be checked",
         "📚 Resources",
         "💬 Student questions",
+        "📨 Feedback & payments",
     ])
 
     with tab_profile:
         st.subheader("🏫 Register classes and subjects you teach")
+        profile = get_teacher_profile(st.session_state.teacher_id)
+        linked_subjects = get_teacher_subject_links(st.session_state.teacher_id)
+
+        saved_subjects = sorted({row[0] for row in linked_subjects if row[0]})
+        saved_grades = sorted({row[1] for row in linked_subjects if row[1]})
+        if not saved_grades and profile and profile[3]:
+            saved_grades = [g.strip() for g in str(profile[3]).split(",") if g.strip()]
+
         with st.form("teacher_profile"):
-            t_name = st.text_input("Your full name", value=st.session_state.teacher_name)
-            t_email = st.text_input("Your email")
-            t_grades = st.multiselect("Classes you teach", GRADE_LEVEL_OPTIONS)
-            t_subjects = st.multiselect("Subjects you teach", SUBJECTS)
+            t_name = st.text_input("Your full name", value=(profile[1] if profile else st.session_state.teacher_name))
+            t_email = st.text_input("Your email", value=(profile[2] if profile and profile[2] else ""))
+            t_grades = st.multiselect("Classes you teach", GRADE_LEVEL_OPTIONS, default=saved_grades)
+            t_subjects = st.multiselect("Subjects you teach", SUBJECTS, default=saved_subjects)
             t_submitted = st.form_submit_button("Save my profile", type="primary")
             if t_submitted:
                 if not t_name.strip() or not t_subjects or not t_grades:
                     st.warning("Please provide your name, at least one class, and at least one subject.")
                 else:
-                    register_teacher_for_subjects(t_name.strip(), t_email.strip(), t_subjects, t_grades)
+                    register_teacher_for_subjects(
+                        t_name.strip(),
+                        t_email.strip(),
+                        t_subjects,
+                        t_grades,
+                        teacher_id=st.session_state.teacher_id,
+                    )
+                    st.session_state.teacher_name = t_name.strip()
                     st.success("Profile updated successfully.")
 
         st.divider()
@@ -2309,6 +2735,99 @@ def teacher_view(model):
                 st.write(question_text)
                 st.caption(created_at)
                 st.divider()
+
+    with tab_feedback:
+        st.subheader("📨 Suggestions, complaints, and payment requests")
+        fb_tab, pay_tab = st.tabs(["💬 Feedback", "💳 Payment requests"])
+
+        with fb_tab:
+            suggestions = get_recent_suggestions(limit=100)
+            if not suggestions:
+                st.info("No feedback submissions yet.")
+            else:
+                for suggestion_id, user_role, user_name, user_email, category, message, created_at in suggestions:
+                    with st.expander(f"{category} · {user_name or 'Anonymous'} · {created_at}"):
+                        st.caption(f"Role: {user_role or 'Unknown'} · Email: {user_email or 'Not provided'}")
+                        st.write(message)
+
+        with pay_tab:
+            payment_rows = get_payment_requests(limit=100)
+            if not payment_rows:
+                st.info("No payment requests submitted yet.")
+            else:
+                status_filter = st.selectbox(
+                    "Filter by status",
+                    ["All", "pending", "approved", "rejected"],
+                    key="payment_status_filter",
+                )
+                query = st.text_input(
+                    "Search by reference / name / email",
+                    key="payment_search_query",
+                    placeholder="e.g. trx_123 or student name",
+                ).strip().lower()
+
+                filtered_rows = []
+                for row in payment_rows:
+                    request_id, user_role, user_identifier, user_name, user_email, reference, note, status, reviewed_by, reviewed_note, reviewed_at, created_at = row
+                    if status_filter != "All" and status != status_filter:
+                        continue
+                    search_blob = " ".join([
+                        str(reference or ""),
+                        str(user_name or ""),
+                        str(user_email or ""),
+                        str(user_role or ""),
+                    ]).lower()
+                    if query and query not in search_blob:
+                        continue
+                    filtered_rows.append(row)
+
+                st.caption(f"Showing {len(filtered_rows)} request(s)")
+                for request_id, user_role, user_identifier, user_name, user_email, reference, note, status, reviewed_by, reviewed_note, reviewed_at, created_at in filtered_rows:
+                    with st.expander(f"Ref: {reference or 'No reference'} · {user_name or 'Unknown'} · {created_at}"):
+                        st.caption(f"Role: {user_role or 'Unknown'} · Email: {user_email or 'Not provided'} · Status: {status}")
+                        if reviewed_at:
+                            st.caption(f"Reviewed by: {reviewed_by or 'Unknown'} at {reviewed_at}")
+                        if reviewed_note:
+                            st.info(f"Review note: {reviewed_note}")
+                        if note:
+                            st.write(note)
+
+                        if status != "approved":
+                            c1, c2, c3 = st.columns(3)
+                            approve_days = c1.number_input(
+                                "Days",
+                                min_value=7,
+                                max_value=365,
+                                value=PREMIUM_DAYS_DEFAULT,
+                                key=f"approve_days_{request_id}",
+                            )
+                            if c2.button("Approve + Grant", key=f"approve_pay_{request_id}", type="primary"):
+                                ok, msg = grant_premium_access(
+                                    user_role or "Student",
+                                    user_identifier=user_identifier,
+                                    user_email=user_email,
+                                    days=int(approve_days),
+                                )
+                                if ok:
+                                    update_payment_request_status(
+                                        request_id,
+                                        "approved",
+                                        reviewed_by=st.session_state.get("teacher_name", "Teacher"),
+                                        reviewed_note=f"Approved for {int(approve_days)} day(s).",
+                                    )
+                                    st.success(msg)
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+                            if c3.button("Reject", key=f"reject_pay_{request_id}"):
+                                update_payment_request_status(
+                                    request_id,
+                                    "rejected",
+                                    reviewed_by=st.session_state.get("teacher_name", "Teacher"),
+                                    reviewed_note="Payment could not be verified.",
+                                )
+                                st.warning("Payment request marked as rejected.")
+                                st.rerun()
  
  
 # --------------------------------------------------------------------------- #
@@ -2919,17 +3438,23 @@ def _step_details():
     st.info("Your roll number will be assigned automatically when you confirm registration.")
 
     with st.expander("Already registered? Continue with your roll number", expanded=False):
-        existing_roll = st.text_input("Roll number", placeholder="e.g. 2026002")
-        if existing_roll.strip():
-            existing = get_student_by_roll(existing_roll.strip())
-            if existing:
-                st.success(f"Welcome back, {existing[1]}.")
-                if st.button("Continue as this student →", type="primary", key="continue_existing_roll"):
+        with st.form("student_login"):
+            existing_roll = st.text_input("Roll number", placeholder="e.g. 2026002")
+            existing_password = st.text_input("Password", type="password")
+            login_pressed = st.form_submit_button("Login as student", type="primary")
+
+        if login_pressed:
+            if not existing_roll.strip() or not existing_password:
+                st.warning("Please enter both roll number and password.")
+            else:
+                existing = authenticate_student(existing_roll.strip(), existing_password)
+                if existing:
+                    st.success(f"Welcome back, {existing[1]}.")
                     st.session_state.student_id = existing[0]
                     st.session_state.student_name = existing[1]
                     st.rerun()
-            else:
-                st.warning("That roll number was not found.")
+                else:
+                    st.error("Invalid roll number or password.")
 
     data = st.session_state.signup_data
     roll_preview = data.get("roll") or "Will be generated on confirmation"
@@ -2938,6 +3463,8 @@ def _step_details():
     name = st.text_input("Full name", value=data.get("name", ""))
     email = st.text_input("Email address", value=data.get("email", ""),
                           placeholder="you@example.com")
+    password = st.text_input("Create password", type="password", value=data.get("password", ""))
+    confirm_password = st.text_input("Confirm password", type="password", value=data.get("confirm_password", ""))
     grade_options = GRADE_LEVEL_OPTIONS
     existing_grade = data.get("grade", "")
     default_grade_idx = grade_options.index(existing_grade) if existing_grade in grade_options else 0
@@ -2950,10 +3477,17 @@ def _step_details():
             st.warning("Name and email are required.")
         elif "@" not in email:
             st.warning("Please enter a valid email address.")
+        elif len(password) < 6:
+            st.warning("Please create a password with at least 6 characters.")
+        elif password != confirm_password:
+            st.warning("Passwords do not match.")
         else:
             st.session_state.signup_data.update({
                 "name": name.strip(),
-                "email": email.strip(), "grade": (grade or "").strip(),
+                "email": email.strip(),
+                "password": password,
+                "confirm_password": confirm_password,
+                "grade": (grade or "").strip(),
             })
             st.session_state.signup_step = 2
             st.rerun()
@@ -3033,7 +3567,13 @@ def _step_confirm(model):
         if st.session_state.get("student_id"):
             student_id = st.session_state.student_id
         else:
-            student_id, assigned_roll = register_student(data["name"], None, data.get("grade", ""), data["email"])
+            student_id, assigned_roll = register_student(
+                data["name"],
+                None,
+                data.get("grade", ""),
+                data["email"],
+                data.get("password", ""),
+            )
             if student_id is None:
                 st.error("We could not create your registration right now. Please try again.")
                 return
@@ -3058,6 +3598,13 @@ def _step_confirm(model):
  
 def _signup_dashboard():
     st.markdown(f"### 🎉 You're all set, {st.session_state.student_name}!")
+
+    premium_until = get_user_premium_until("Student")
+    if premium_until and premium_until >= _today_date():
+        days_left = (premium_until - _today_date()).days
+        st.success(f"⭐ Premium active until {premium_until.isoformat()} ({days_left} day(s) left)")
+    else:
+        st.info("Free plan active: 10 AI questions per day. Upgrade from the sidebar payment panel for unlimited AI.")
  
     if st.session_state.get("welcome_note"):
         st.markdown(f'<div class="sh-note">💬 {st.session_state["welcome_note"]}</div>',
@@ -3335,7 +3882,7 @@ def student_view(model):
  
 # --------------------------------------------------------------------------- #
 def main():
-    st.set_page_config(page_title="ScholarWave Learning Hub", page_icon="🌊", layout="wide")
+    st.set_page_config(page_title="ScholarWave Learning Hub | KG to A-Level", page_icon="🌊", layout="wide")
     _render_mobile_install_prompt()
 
     create_tables()
@@ -3350,10 +3897,12 @@ def main():
     seed_flashcards()
 
     _render_org_header()
+    _render_corner_suggestion_box()
 
     st.sidebar.title("🌊 ScholarWave Hub")
     role = _render_role_selector()
     _render_mode_toggle()
+    _render_feedback_and_payment_panel()
     
     if role == "Student":
         _render_pomodoro_sidebar()
@@ -3363,9 +3912,16 @@ def main():
     if not ai_ready(model):
         st.sidebar.warning("AI features are off (no key set) — video + notes still work.")
     else:
-        role_usage = get_ai_usage_count(role=role)
-        remaining = max(DAILY_AI_QUOTA - role_usage, 0)
-        st.sidebar.caption(f"AI daily quota ({role}): {role_usage}/{DAILY_AI_QUOTA} used ({remaining} left)")
+        if is_user_premium(role):
+            premium_until = get_user_premium_until(role)
+            if premium_until:
+                st.sidebar.caption(f"AI daily quota ({role}): Premium active until {premium_until.isoformat()} (unlimited AI)")
+            else:
+                st.sidebar.caption(f"AI daily quota ({role}): Premium active (unlimited AI)")
+        else:
+            role_usage = get_ai_usage_count(role=role)
+            remaining = max(DAILY_AI_QUOTA - role_usage, 0)
+            st.sidebar.caption(f"AI daily quota ({role}): {role_usage}/{DAILY_AI_QUOTA} used ({remaining} left)")
     st.sidebar.caption(f"{len(load_index())} lecture(s) available.")
 
     if role == "Teacher":
@@ -3375,6 +3931,8 @@ def main():
         st.title("🎯 Study smarter")
         st.caption("Pick a subject, watch the lecture, and let your AI tutor make revision feel lighter and brighter.")
         student_view(model)
+
+    _render_seo_keywords_footer()
  
  
 if __name__ == "__main__":
