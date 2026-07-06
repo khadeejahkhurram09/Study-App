@@ -34,7 +34,7 @@ def _resolve_ai_usage_identity(role=None):
 
     if "anonymous_ai_session_id" not in st.session_state:
         st.session_state["anonymous_ai_session_id"] = uuid.uuid4().hex[:12]
-    return active_role, f"session:{st.session_state['anonymous_ai_session_id']}"
+    return active_role, f"session:{active_role.lower()}:{st.session_state['anonymous_ai_session_id']}"
 
 
 def _today_date():
@@ -209,111 +209,29 @@ DEFAULT_MODEL = "Groq"
 
 
 def get_ai_client():
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        return None
-    return Groq(api_key=api_key)
-
-
-def ai_ready(model):
-    return get_ai_client() is not None
- 
- 
-# --------------------------------------------------------------------------- #
-# Data helpers (lecture index — unchanged)
-# --------------------------------------------------------------------------- #
-def load_index() -> list:
-    if INDEX_FILE.exists():
-        try:
-            return json.loads(INDEX_FILE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return []
-    return []
- 
- 
-def save_index(items: list) -> None:
-    INDEX_FILE.write_text(json.dumps(items, indent=2), encoding="utf-8")
- 
- 
-def safe_name(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:60]
- 
- 
-def add_lecture(title, subject, description, notes, uploaded_file, teacher_id=None, grade_level=None) -> None:
-    lid = uuid.uuid4().hex[:10]
-    ext = Path(uploaded_file.name).suffix.lower() or ".mp4"
-    fname = f"{lid}_{safe_name(Path(uploaded_file.name).stem)}{ext}"
-    (VIDEO_DIR / fname).write_bytes(uploaded_file.getbuffer())
-    items = load_index()
-    items.append({
-        "id": lid, "title": title.strip(), "subject": subject,
-        "description": description.strip(), "notes": notes.strip(),
-        "teacher_id": teacher_id,
-        "grade_level": grade_level,
-        "video": fname, "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-    })
-    save_index(items)
- 
- 
-def delete_lecture(lid: str) -> None:
-    items = load_index()
-    for it in items:
-        if it["id"] == lid:
-            try:
-                (VIDEO_DIR / it["video"]).unlink(missing_ok=True)
-            except OSError:
-                pass
-    save_index([it for it in items if it["id"] != lid])
- 
- 
-def parse_json(text):
-    if not text:
-        return {}
-
-    cleaned = text.strip()
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    fenced_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, flags=re.IGNORECASE)
-    for block in fenced_blocks:
-        try:
-            return json.loads(block.strip())
-        except json.JSONDecodeError:
-            continue
-
-    starts = [i for i, ch in enumerate(cleaned) if ch in "[{"]
-    for start in starts:
-        opening = cleaned[start]
-        closing = "}" if opening == "{" else "]"
-        depth = 0
-        in_string = False
-        escape = False
-        for idx in range(start, len(cleaned)):
-            ch = cleaned[idx]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-                continue
-
-            if ch == '"':
-                in_string = True
-            elif ch == opening:
-                depth += 1
-            elif ch == closing:
-                depth -= 1
-                if depth == 0:
-                    candidate = cleaned[start:idx + 1]
-                    try:
-                        return json.loads(candidate)
-                    except json.JSONDecodeError:
-                        break
-
+    with tab_questions:
+        st.subheader("💬 Questions from students")
+        st.caption("Students can ask you directly from the study view when they need teacher help.")
+        questions = get_teacher_questions(st.session_state.teacher_id)
+        if not questions:
+            st.info("No questions sent to you yet.")
+        else:
+            for question_id, student_name, subject_name, question_text, answer_text, answered_by, answered_at, created_at in questions:
+                st.markdown(f"**{student_name or 'Student'}** · {subject_name}")
+                st.write(question_text)
+                st.caption(created_at)
+                if answer_text:
+                    st.success(f"Answered by {answered_by or 'Teacher'}{f' at {answered_at}' if answered_at else ''}")
+                    st.write(answer_text)
+                with st.form(f"answer_question_{question_id}"):
+                    reply = st.text_area("Teacher reply", value=answer_text or "", height=120, key=f"teacher_reply_{question_id}")
+                    if st.form_submit_button("Save reply", type="primary"):
+                        if not reply.strip():
+                            st.warning("Please write an answer before saving.")
+                        else:
+                            save_teacher_question_answer(question_id, reply, st.session_state.get("teacher_name", "Teacher"))
+                            st.success("Reply saved.")
+                st.divider()
     return {}
 
 
@@ -407,6 +325,30 @@ def make_quiz(model, lec, n=20):
     res = _call(model, prompt, system, max_tokens=1100)
     data = parse_json(res["text"]) if res["ok"] else None
     return data.get("questions") if isinstance(data, dict) else None
+
+
+def _quiz_bank_fallback(subject_name, count=10):
+    subject_lower = (subject_name or "").lower()
+    bank = []
+    for q in QUIZ_BANK:
+        q_subject = str(q.get("subject", "")).lower()
+        if subject_lower in q_subject or q_subject in subject_lower:
+            bank.append(q)
+    if not bank:
+        bank = QUIZ_BANK[:]
+
+    questions = []
+    for item in bank[:count]:
+        options = item.get("options", [])
+        if not options:
+            continue
+        questions.append({
+            "q": str(item.get("q", "")).strip(),
+            "options": [str(opt) for opt in options],
+            "answer_index": int(item.get("answer_index", 0)),
+            "explanation": str(item.get("explanation", "Review this concept from your notes.")),
+        })
+    return questions
  
  
 def generate_welcome_note(model, name, subjects):
@@ -815,9 +757,20 @@ def create_teacher_questions_table():
             subject_name TEXT NOT NULL,
             teacher_id INTEGER,
             question_text TEXT NOT NULL,
+            answer_text TEXT,
+            answered_by TEXT,
+            answered_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
+        cursor.execute("PRAGMA table_info(teacher_questions);")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "answer_text" not in columns:
+            cursor.execute("ALTER TABLE teacher_questions ADD COLUMN answer_text TEXT;")
+        if "answered_by" not in columns:
+            cursor.execute("ALTER TABLE teacher_questions ADD COLUMN answered_by TEXT;")
+        if "answered_at" not in columns:
+            cursor.execute("ALTER TABLE teacher_questions ADD COLUMN answered_at TIMESTAMP;")
         conn.commit()
 
 
@@ -834,15 +787,41 @@ def save_teacher_question(student_id, subject_name, teacher_id, question_text, s
     return True
 
 
+def save_teacher_question_answer(question_id, answer_text, answered_by=None):
+    if not question_id or not answer_text:
+        return False
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE teacher_questions SET answer_text = ?, answered_by = ?, answered_at = CURRENT_TIMESTAMP WHERE question_id = ?;",
+            (answer_text.strip(), answered_by, question_id),
+        )
+        conn.commit()
+    return True
+
+
 def get_teacher_questions(teacher_id):
     with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-        SELECT question_id, student_name, subject_name, question_text, created_at
+        SELECT question_id, student_name, subject_name, question_text, answer_text, answered_by, answered_at, created_at
         FROM teacher_questions
         WHERE teacher_id IS NULL OR teacher_id = ?
         ORDER BY created_at DESC;
     """, (teacher_id,))
+        rows = cursor.fetchall()
+    return rows
+
+
+def get_student_teacher_questions(student_id):
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT question_id, subject_name, question_text, answer_text, answered_by, answered_at, created_at
+        FROM teacher_questions
+        WHERE student_id = ?
+        ORDER BY created_at DESC;
+        """, (student_id,))
         rows = cursor.fetchall()
     return rows
 
@@ -2481,7 +2460,7 @@ def teacher_view(model):
             st.session_state.pop(key, None)
         st.rerun()
 
-    tab_profile, tab_upload, tab_flashcards, tab_assessments, tab_to_check, tab_resources, tab_questions, tab_feedback = st.tabs([
+    tab_profile, tab_upload, tab_flashcards, tab_assessments, tab_to_check, tab_resources, tab_questions = st.tabs([
         "🏫 My classes & subjects",
         "📤 Upload lecture",
         "🧠 Manage flashcards",
@@ -2489,7 +2468,6 @@ def teacher_view(model):
         "✅ To be checked",
         "📚 Resources",
         "💬 Student questions",
-        "📨 Feedback & payments",
     ])
 
     with tab_profile:
@@ -2665,64 +2643,6 @@ def teacher_view(model):
                             update_submission_grade(submission_id, teacher_score=float(teacher_mark), teacher_feedback=feedback)
                             st.success("Teacher grade saved.")
 
-    with tab_resources:
-        st.subheader("📚 Resource Manager")
-        res_syllabus, res_textbooks, res_papers = st.tabs(["📘 Syllabus", "📖 Textbooks", "📄 Past Papers"])
-
-        with res_syllabus:
-            with st.form("teacher_syllabus_upload", clear_on_submit=True):
-                sy_subject = st.selectbox("Subject", SUBJECTS, key="sy_subject")
-                sy_grade = st.selectbox("Class", GRADE_LEVEL_OPTIONS, key="sy_grade")
-                sy_title = st.text_input("Syllabus title", placeholder="e.g. Cambridge O Level Physics 2026")
-                sy_file = st.file_uploader("Upload syllabus", type=["pdf", "txt", "docx"], key="sy_file")
-                chapters_text = st.text_area("Paste syllabus topics (one per line)", height=160)
-                if st.form_submit_button("Save syllabus", type="primary"):
-                    if not sy_title.strip() or not chapters_text.strip():
-                        st.warning("Please provide a title and chapter list.")
-                    else:
-                        sy_path = save_uploaded_file(sy_file, "syllabus", "syllabus") if sy_file else None
-                        add_syllabus_document(sy_subject, sy_grade, sy_title.strip(), sy_path, chapters_text.strip())
-                        for chapter_line in chapters_text.splitlines():
-                            ch = chapter_line.strip()
-                            if ch:
-                                add_syllabus_chapter(sy_subject, ch, sy_grade)
-                        st.success("Syllabus uploaded and chapter checklist updated.")
-
-        with res_textbooks:
-            with st.form("teacher_textbook_upload", clear_on_submit=True):
-                tb_subject = st.selectbox("Subject", SUBJECTS, key="tb_subject")
-                tb_title = st.text_input("Title")
-                tb_author = st.text_input("Author")
-                tb_desc = st.text_area("Description", height=100)
-                tb_file = st.file_uploader("File (optional)", type=["pdf", "txt", "docx"], key="tb_file")
-                tb_url = st.text_input("External URL (optional)")
-                if st.form_submit_button("Add textbook", type="primary"):
-                    if not tb_title.strip():
-                        st.warning("Please add a textbook title.")
-                    else:
-                        tb_path = save_uploaded_file(tb_file, "textbooks", "textbook") if tb_file else None
-                        add_textbook(tb_subject, tb_title.strip(), tb_author.strip() or None, tb_desc.strip() or None, file_path=tb_path, external_url=tb_url.strip() or None, added_by=st.session_state.teacher_name)
-                        st.success("Textbook added.")
-
-        with res_papers:
-            with st.form("teacher_pastpaper_upload", clear_on_submit=True):
-                pp_subject = st.selectbox("Subject", SUBJECTS, key="pp_subject")
-                pp_grade = st.selectbox("Class", GRADE_LEVEL_OPTIONS, key="pp_grade")
-                pp_year = st.number_input("Year", min_value=1990, max_value=2100, value=2024)
-                pp_type = st.text_input("Paper type", placeholder="e.g. Paper")
-                pp_season = st.text_input("Season", placeholder="e.g. May/June")
-                pp_number = st.text_input("Paper number", placeholder="e.g. 2")
-                pp_duration = st.number_input("Time allowed (minutes)", min_value=5, max_value=300, value=60, key="pp_duration")
-                qp_file = st.file_uploader("Question paper", type=["pdf", "txt", "docx"], key="pp_qp")
-                ms_file = st.file_uploader("Mark scheme", type=["pdf", "txt", "docx"], key="pp_ms")
-                er_file = st.file_uploader("Examiner report", type=["pdf", "txt", "docx"], key="pp_er")
-                if st.form_submit_button("Add past paper", type="primary"):
-                    qp_path = save_uploaded_file(qp_file, "past_papers", "qp") if qp_file else None
-                    ms_path = save_uploaded_file(ms_file, "past_papers", "ms") if ms_file else None
-                    er_path = save_uploaded_file(er_file, "past_papers", "er") if er_file else None
-                    add_past_paper(pp_subject, int(pp_year), pp_type.strip(), pp_season.strip(), pp_number.strip(), qp_path, ms_path, er_path, pp_grade, int(pp_duration))
-                    st.success("Past paper added.")
-
     with tab_questions:
         st.subheader("💬 Questions from students")
         st.caption("Students can ask you directly from the study view when they need teacher help.")
@@ -2730,104 +2650,22 @@ def teacher_view(model):
         if not questions:
             st.info("No questions sent to you yet.")
         else:
-            for question_id, student_name, subject_name, question_text, created_at in questions:
+            for question_id, student_name, subject_name, question_text, answer_text, answered_by, answered_at, created_at in questions:
                 st.markdown(f"**{student_name or 'Student'}** · {subject_name}")
                 st.write(question_text)
                 st.caption(created_at)
+                if answer_text:
+                    st.success(f"Answered by {answered_by or 'Teacher'}{f' at {answered_at}' if answered_at else ''}")
+                    st.write(answer_text)
+                with st.form(f"answer_question_{question_id}"):
+                    reply = st.text_area("Teacher reply", value=answer_text or "", height=120, key=f"teacher_reply_{question_id}")
+                    if st.form_submit_button("Save reply", type="primary"):
+                        if not reply.strip():
+                            st.warning("Please write an answer before saving.")
+                        else:
+                            save_teacher_question_answer(question_id, reply, st.session_state.get("teacher_name", "Teacher"))
+                            st.success("Reply saved.")
                 st.divider()
-
-    with tab_feedback:
-        st.subheader("📨 Suggestions, complaints, and payment requests")
-        fb_tab, pay_tab = st.tabs(["💬 Feedback", "💳 Payment requests"])
-
-        with fb_tab:
-            suggestions = get_recent_suggestions(limit=100)
-            if not suggestions:
-                st.info("No feedback submissions yet.")
-            else:
-                for suggestion_id, user_role, user_name, user_email, category, message, created_at in suggestions:
-                    with st.expander(f"{category} · {user_name or 'Anonymous'} · {created_at}"):
-                        st.caption(f"Role: {user_role or 'Unknown'} · Email: {user_email or 'Not provided'}")
-                        st.write(message)
-
-        with pay_tab:
-            payment_rows = get_payment_requests(limit=100)
-            if not payment_rows:
-                st.info("No payment requests submitted yet.")
-            else:
-                status_filter = st.selectbox(
-                    "Filter by status",
-                    ["All", "pending", "approved", "rejected"],
-                    key="payment_status_filter",
-                )
-                query = st.text_input(
-                    "Search by reference / name / email",
-                    key="payment_search_query",
-                    placeholder="e.g. trx_123 or student name",
-                ).strip().lower()
-
-                filtered_rows = []
-                for row in payment_rows:
-                    request_id, user_role, user_identifier, user_name, user_email, reference, note, status, reviewed_by, reviewed_note, reviewed_at, created_at = row
-                    if status_filter != "All" and status != status_filter:
-                        continue
-                    search_blob = " ".join([
-                        str(reference or ""),
-                        str(user_name or ""),
-                        str(user_email or ""),
-                        str(user_role or ""),
-                    ]).lower()
-                    if query and query not in search_blob:
-                        continue
-                    filtered_rows.append(row)
-
-                st.caption(f"Showing {len(filtered_rows)} request(s)")
-                for request_id, user_role, user_identifier, user_name, user_email, reference, note, status, reviewed_by, reviewed_note, reviewed_at, created_at in filtered_rows:
-                    with st.expander(f"Ref: {reference or 'No reference'} · {user_name or 'Unknown'} · {created_at}"):
-                        st.caption(f"Role: {user_role or 'Unknown'} · Email: {user_email or 'Not provided'} · Status: {status}")
-                        if reviewed_at:
-                            st.caption(f"Reviewed by: {reviewed_by or 'Unknown'} at {reviewed_at}")
-                        if reviewed_note:
-                            st.info(f"Review note: {reviewed_note}")
-                        if note:
-                            st.write(note)
-
-                        if status != "approved":
-                            c1, c2, c3 = st.columns(3)
-                            approve_days = c1.number_input(
-                                "Days",
-                                min_value=7,
-                                max_value=365,
-                                value=PREMIUM_DAYS_DEFAULT,
-                                key=f"approve_days_{request_id}",
-                            )
-                            if c2.button("Approve + Grant", key=f"approve_pay_{request_id}", type="primary"):
-                                ok, msg = grant_premium_access(
-                                    user_role or "Student",
-                                    user_identifier=user_identifier,
-                                    user_email=user_email,
-                                    days=int(approve_days),
-                                )
-                                if ok:
-                                    update_payment_request_status(
-                                        request_id,
-                                        "approved",
-                                        reviewed_by=st.session_state.get("teacher_name", "Teacher"),
-                                        reviewed_note=f"Approved for {int(approve_days)} day(s).",
-                                    )
-                                    st.success(msg)
-                                    st.rerun()
-                                else:
-                                    st.error(msg)
-                            if c3.button("Reject", key=f"reject_pay_{request_id}"):
-                                update_payment_request_status(
-                                    request_id,
-                                    "rejected",
-                                    reviewed_by=st.session_state.get("teacher_name", "Teacher"),
-                                    reviewed_note="Payment could not be verified.",
-                                )
-                                st.warning("Payment request marked as rejected.")
-                                st.rerun()
  
  
 # --------------------------------------------------------------------------- #
@@ -2894,7 +2732,7 @@ def _render_syllabus_checklist(subject_name, grade_level=None):
         if st.session_state.get(key):
             completed += 1
     progress = int(completed / len(chapters) * 100) if chapters else 0
-    st.progress(progress)
+    st.progress(max(0.0, min(progress / 100.0, 1.0)))
     st.caption(f"{completed}/{len(chapters)} chapters completed")
 
     cols = st.columns(2)
@@ -3308,6 +3146,22 @@ def _play_lecture(lec, model, active_subject, grade_level=None):
                 )
                 st.success("Your question has been sent to your teacher.")
 
+        st.divider()
+        st.markdown("#### Your questions and replies")
+        previous_questions = get_student_teacher_questions(st.session_state.get("student_id"))
+        subject_questions = [row for row in previous_questions if row[1] == teacher_subject]
+        if not subject_questions:
+            st.info("No replies yet for this subject.")
+        else:
+            for question_id, subject_name, question_text, answer_text, answered_by, answered_at, created_at in subject_questions:
+                with st.expander(f"{subject_name} · {created_at}"):
+                    st.write(question_text)
+                    if answer_text:
+                        st.success(f"Answered by {answered_by or 'Teacher'}{f' at {answered_at}' if answered_at else ''}")
+                        st.write(answer_text)
+                    else:
+                        st.info("Waiting for a teacher reply.")
+
     with tab_quiz:
         if not ai_ready(model):
             st.info("Quizzes need the AI, which isn't configured here.")
@@ -3319,10 +3173,36 @@ def _quiz_ui(lec, model):
     qkey = f"quiz_{lec['id']}"
     if st.button("🎯 Make me a quiz", key=f"mkquiz_{lec['id']}"):
         with st.spinner("Writing your quiz…"):
-            st.session_state[qkey] = make_quiz(model, lec)
+            quiz = make_quiz(model, lec)
+            if not quiz:
+                quiz = _quiz_bank_fallback(lec.get("subject"), count=10)
+            st.session_state[qkey] = quiz
             st.session_state[f"{qkey}_submitted"] = False
     quiz = st.session_state.get(qkey)
     if not quiz:
+        return
+    normalized_quiz = []
+    for item in quiz:
+        if not isinstance(item, dict):
+            continue
+        options = item.get("options") or []
+        if not options:
+            continue
+        try:
+            answer_index = int(item.get("answer_index", 0))
+        except (TypeError, ValueError):
+            answer_index = 0
+        if answer_index < 0 or answer_index >= len(options):
+            answer_index = 0
+        normalized_quiz.append({
+            "q": str(item.get("q") or item.get("question") or "").strip(),
+            "options": [str(opt) for opt in options],
+            "answer_index": answer_index,
+            "explanation": str(item.get("explanation") or item.get("hint") or "Review the related topic notes and key definitions."),
+        })
+    quiz = normalized_quiz
+    if not quiz:
+        st.info("No quiz questions could be generated for this lecture right now.")
         return
     answers = {}
     for i, item in enumerate(quiz):
@@ -3756,7 +3636,7 @@ def student_view(model):
             metric_cols[2].metric("Best score", f"{summary['best_percentage']}%")
             metric_cols[3].metric("Assessments", summary['total'])
 
-            st.progress(min(summary['average_percentage'], 100))
+            st.progress(max(0.0, min(summary['average_percentage'] / 100.0, 1.0)))
             threshold = get_student_threshold(st.session_state.student_id)
             st.caption(f"Your target threshold: {threshold}%")
             st.caption(get_performance_recommendation(summary['average_percentage']))
@@ -3780,7 +3660,7 @@ def student_view(model):
             st.markdown("#### Subject overview")
             for subject, pct in sorted(summary['subject_breakdown'].items()):
                 st.write(f"**{subject}**")
-                st.progress(min(pct, 100))
+                st.progress(max(0.0, min(pct / 100.0, 1.0)))
                 st.caption(f"Average performance: {pct}%")
 
             st.divider()
@@ -3902,7 +3782,8 @@ def main():
     st.sidebar.title("🌊 ScholarWave Hub")
     role = _render_role_selector()
     _render_mode_toggle()
-    _render_feedback_and_payment_panel()
+    if role == "Student":
+        _render_feedback_and_payment_panel()
     
     if role == "Student":
         _render_pomodoro_sidebar()
