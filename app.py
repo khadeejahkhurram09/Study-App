@@ -5,6 +5,7 @@ import json
 import uuid
 import sqlite3
 import hashlib
+import shutil
 from pathlib import Path
 from datetime import datetime, timedelta
  
@@ -163,11 +164,51 @@ load_dotenv()
 # --------------------------------------------------------------------------- #
 # Storage + config
 # --------------------------------------------------------------------------- #
-DATA_DIR = Path(__file__).with_name("lecture_data")
+# Set SCHOLARWAVE_DATA_DIR to a persistent folder in production.
+DATA_DIR = Path(os.environ.get("SCHOLARWAVE_DATA_DIR", str(Path(__file__).with_name("lecture_data")))).expanduser()
 VIDEO_DIR = DATA_DIR / "videos"
 INDEX_FILE = DATA_DIR / "index.json"
 DB_PATH = DATA_DIR / "school.db"          # <-- preference-system database lives alongside lecture data
+BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_RETENTION = int(os.environ.get("SCHOLARWAVE_BACKUP_RETENTION", "30"))
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _backup_data_files():
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_targets = []
+    if DB_PATH.exists():
+        backup_targets.append((DB_PATH, BACKUP_DIR / f"school_{stamp}.db"))
+    if INDEX_FILE.exists():
+        backup_targets.append((INDEX_FILE, BACKUP_DIR / f"index_{stamp}.json"))
+
+    for src, dst in backup_targets:
+        try:
+            shutil.copy2(src, dst)
+        except OSError:
+            # Never block startup if backup fails.
+            continue
+
+    # Keep only the newest N backup files.
+    if BACKUP_RETENTION > 0:
+        backups = sorted(BACKUP_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in backups[BACKUP_RETENTION:]:
+            try:
+                old.unlink()
+            except OSError:
+                continue
+
+
+def load_index():
+    if not INDEX_FILE.exists():
+        return []
+    try:
+        with open(INDEX_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
  
 SUBJECTS = [
     "Accounting", "Additional Mathematics", "Agriculture", "Arabic", "Art & Design",
@@ -3748,6 +3789,8 @@ def student_view(model):
 def main():
     st.set_page_config(page_title="ScholarWave Learning Hub | KG to A-Level", page_icon="🌊", layout="wide")
     _render_mobile_install_prompt()
+
+    _backup_data_files()
 
     create_tables()
     create_syllabus_table()
