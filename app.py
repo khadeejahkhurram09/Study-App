@@ -305,15 +305,77 @@ def generate_boss_battle_challenge(model, subject_name, grade_level, topic):
     # Get syllabus chapters for context
     chapters = get_syllabus_chapters(subject_name)
     syllabus_context = f"Syllabus chapters: {', '.join(chapters[:5])}" if chapters else ""
-    
+
     system = "You create motivating mini study challenges for students using a playful but supportive tone. Return ONLY JSON with format: {\"questions\":[{\"question\":\"...\",\"options\":[\"A\",\"B\",\"C\",\"D\"],\"correct_index\":0,\"hint\":\"...\",\"explanation\":\"...\"}],\"final_mission\":\"...\"}"
     prompt = (f"Create a short 'Boss Battle' challenge for a student in {grade_level or 'the chosen grade'} studying {subject_name}. "
               f"The topic is: {topic}. {syllabus_context} "
-              f"Include 20 multiple-choice questions with options, hints, and explanations. Base questions on the syllabus content and topic, and keep them challenging. Also include a final mission. "
+              f"Include 10 multiple-choice questions with options, hints, and explanations. Base questions on the syllabus content and topic, and keep them challenging. Also include a final mission. "
               "Keep it concise and motivating.")
-    res = _call(model, prompt, system, max_tokens=900)
+    res = _call(model, prompt, system, max_tokens=1800)
     data = parse_json(res["text"]) if res.get("ok") else None
-    return data if data else {"questions": [], "final_mission": "AI study challenge is not available right now."}
+
+    # Normalize/validate AI response before using it.
+    if isinstance(data, dict):
+        normalized_questions = []
+        for item in data.get("questions", []):
+            if not isinstance(item, dict):
+                continue
+            options = item.get("options") or []
+            if not isinstance(options, list) or len(options) < 2:
+                continue
+            try:
+                correct_index = int(item.get("correct_index", 0))
+            except (TypeError, ValueError):
+                correct_index = 0
+            if correct_index < 0 or correct_index >= len(options):
+                correct_index = 0
+            normalized_questions.append({
+                "question": str(item.get("question") or "").strip(),
+                "options": [str(opt) for opt in options],
+                "correct_index": correct_index,
+                "hint": str(item.get("hint") or "Think about the core concept and eliminate unlikely options."),
+                "explanation": str(item.get("explanation") or "Review the related topic notes and key definitions."),
+            })
+
+        if normalized_questions:
+            return {
+                "questions": normalized_questions,
+                "final_mission": str(data.get("final_mission") or "Great effort. Revisit weak spots and try again for a perfect score!"),
+            }
+
+    # Fallback: keep Boss Battle usable even if AI JSON is malformed or quota is exhausted.
+    bank = []
+    subject_lower = (subject_name or "").lower()
+    for q in QUIZ_BANK:
+        q_subject = str(q.get("subject", "")).lower()
+        if subject_lower in q_subject or q_subject in subject_lower:
+            bank.append(q)
+    if not bank:
+        bank = QUIZ_BANK[:]
+
+    fallback_questions = []
+    for q in bank[:10]:
+        options = q.get("options", [])
+        if not options:
+            continue
+        fallback_questions.append({
+            "question": q.get("q", ""),
+            "options": options,
+            "correct_index": int(q.get("answer_index", 0)),
+            "hint": "Use elimination and recall the key definition/formula.",
+            "explanation": q.get("explanation", "Review this concept from your notes."),
+        })
+
+    fallback_message = (
+        "AI challenge generation is temporarily unavailable, so we loaded a practice Boss Battle from your local question bank."
+    )
+    if res and not res.get("ok") and res.get("text"):
+        fallback_message = res["text"]
+
+    return {
+        "questions": fallback_questions,
+        "final_mission": fallback_message,
+    }
 
 
 def simplify_for_eli5(model, subject_name, topic, explanation):
