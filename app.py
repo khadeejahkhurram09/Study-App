@@ -209,30 +209,14 @@ DEFAULT_MODEL = "Groq"
 
 
 def get_ai_client():
-    with tab_questions:
-        st.subheader("💬 Questions from students")
-        st.caption("Students can ask you directly from the study view when they need teacher help.")
-        questions = get_teacher_questions(st.session_state.teacher_id)
-        if not questions:
-            st.info("No questions sent to you yet.")
-        else:
-            for question_id, student_name, subject_name, question_text, answer_text, answered_by, answered_at, created_at in questions:
-                st.markdown(f"**{student_name or 'Student'}** · {subject_name}")
-                st.write(question_text)
-                st.caption(created_at)
-                if answer_text:
-                    st.success(f"Answered by {answered_by or 'Teacher'}{f' at {answered_at}' if answered_at else ''}")
-                    st.write(answer_text)
-                with st.form(f"answer_question_{question_id}"):
-                    reply = st.text_area("Teacher reply", value=answer_text or "", height=120, key=f"teacher_reply_{question_id}")
-                    if st.form_submit_button("Save reply", type="primary"):
-                        if not reply.strip():
-                            st.warning("Please write an answer before saving.")
-                        else:
-                            save_teacher_question_answer(question_id, reply, st.session_state.get("teacher_name", "Teacher"))
-                            st.success("Reply saved.")
-                st.divider()
-    return {}
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        return None
+    return Groq(api_key=api_key)
+
+
+def ai_ready(model=None):
+    return get_ai_client() is not None
 
 
 def parse_score_value(value, total_marks):
