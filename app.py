@@ -209,6 +209,80 @@ def load_index():
     except (OSError, json.JSONDecodeError):
         return []
     return data if isinstance(data, list) else []
+
+
+def safe_name(value):
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or "item"
+
+
+def parse_json(text):
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if not raw:
+        return None
+
+    # Direct parse first.
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Handle fenced blocks like ```json ... ```.
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, flags=re.IGNORECASE | re.DOTALL)
+    if fence:
+        fenced_text = fence.group(1).strip()
+        try:
+            return json.loads(fenced_text)
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: try from first object/array bracket to the last one.
+    start_candidates = [i for i in (raw.find("{"), raw.find("[")) if i != -1]
+    end_candidates = [raw.rfind("}"), raw.rfind("]")]
+    if start_candidates and max(end_candidates) != -1:
+        start = min(start_candidates)
+        end = max(end_candidates)
+        if end > start:
+            snippet = raw[start:end + 1]
+            try:
+                return json.loads(snippet)
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+def add_lecture(title, subject, description, notes, video_file, teacher_id=None, grade_level=None):
+    if not title or video_file is None:
+        return None
+
+    video_name = save_uploaded_file(video_file, "videos", "lecture")
+    if not video_name:
+        return None
+    video_path = Path(video_name)
+
+    items = load_index()
+    next_id = max([int(item.get("id", 0)) for item in items] + [0]) + 1
+    lecture = {
+        "id": next_id,
+        "title": str(title).strip(),
+        "subject": str(subject).strip(),
+        "description": str(description or "").strip(),
+        "notes": str(notes or "").strip(),
+        "video": video_path.name,
+        "teacher_id": teacher_id,
+        "grade_level": str(grade_level or "").strip(),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    items.append(lecture)
+
+    INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(INDEX_FILE, "w", encoding="utf-8") as fh:
+        json.dump(items, fh, ensure_ascii=False, indent=2)
+    return lecture
  
 SUBJECTS = [
     "Accounting", "Additional Mathematics", "Agriculture", "Arabic", "Art & Design",
