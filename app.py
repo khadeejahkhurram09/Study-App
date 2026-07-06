@@ -248,7 +248,7 @@ def _call(model, prompt, system, max_tokens=700):
             model=GROQ_MODEL,
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": prompt}],
-            temperature=1,
+            temperature=0.7,
             max_tokens=max_tokens,
         )
         return {"ok": True, "text": resp.choices[0].message.content or ""}
@@ -3291,9 +3291,9 @@ def main():
     st.sidebar.caption(f"{len(load_index())} lecture(s) available.")
 
     if role == "Teacher":
-        st.title("👩‍🏫 Teacher dashboard")
-        # Secure it: Only open if the passcode matches.
+        # Check password first so the teacher dashboard stays hidden until unlocked.
         if check_password("teacher_dashboard"):
+            st.title("👩‍🏫 Teacher dashboard")
             teacher_view(model)
     else:
         st.title("🎯 Study smarter")
