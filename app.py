@@ -12,6 +12,57 @@ import streamlit as st
 
 from dotenv import load_dotenv
 from groq import Groq
+
+
+DAILY_AI_QUOTA = 5
+
+
+def _current_quota_date():
+    return datetime.now().date().isoformat()
+
+
+def _get_ai_usage_bucket(role=None):
+    active_role = role or st.session_state.get("role") or "Student"
+    usage = st.session_state.setdefault("ai_questions_asked_by_role", {})
+    bucket = usage.get(active_role)
+
+    today = _current_quota_date()
+    if not isinstance(bucket, dict) or bucket.get("date") != today:
+        bucket = {"date": today, "count": 0}
+        usage[active_role] = bucket
+
+    # Keep a simple compatibility key for the current active role.
+    st.session_state["ai_questions_asked"] = int(bucket.get("count", 0))
+
+    return active_role, bucket
+
+
+def get_ai_usage_count(role=None):
+    _, bucket = _get_ai_usage_bucket(role=role)
+    return int(bucket.get("count", 0))
+
+
+def check_ai_quota(role=None, show_paywall=True):
+    active_role, bucket = _get_ai_usage_bucket(role=role)
+    if int(bucket.get("count", 0)) >= DAILY_AI_QUOTA:
+        if show_paywall:
+            st.error("⚠️ You have reached your limit of 5 free AI queries for today!")
+            col1, col2 = st.columns([2, 1.5])
+            with col1:
+                st.subheader("💳 Upgrade to ScholarWave Premium")
+                st.write("Get unlimited AI questions, essay grading, and advanced cheat sheets for just $2/month.")
+                st.link_button("🚀 Unlock Unlimited Access", "https://buy.stripe.com/mock_link")
+            with col2:
+                st.info("💡 Premium benefits unlock instant server response speeds and personalized O-Level study feedback loops.")
+            st.caption(f"Role: {active_role} · Usage today: {bucket.get('count', 0)}/{DAILY_AI_QUOTA}")
+        return False
+    return True
+
+
+def increment_ai_quota(role=None):
+    _, bucket = _get_ai_usage_bucket(role=role)
+    bucket["count"] = int(bucket.get("count", 0)) + 1
+    return bucket["count"]
  
 load_dotenv()
  
@@ -61,10 +112,6 @@ VIDEO_TYPES = ["mp4", "mov", "webm", "m4v"]
 # --------------------------------------------------------------------------- #
 GROQ_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_MODEL = "Groq"
-try:
-    AI_SESSION_LIMIT = int(os.environ.get("AI_SESSION_LIMIT", "60"))
-except ValueError:
-    AI_SESSION_LIMIT = 60
 
 
 def get_ai_client():
@@ -76,26 +123,6 @@ def get_ai_client():
 
 def ai_ready(model):
     return get_ai_client() is not None
-
-
-def _ai_calls_used():
-    return int(st.session_state.get("ai_calls_used", 0))
-
-
-def _ai_calls_remaining():
-    if AI_SESSION_LIMIT <= 0:
-        return None
-    return max(AI_SESSION_LIMIT - _ai_calls_used(), 0)
-
-
-def _consume_ai_call():
-    if AI_SESSION_LIMIT <= 0:
-        return True
-    remaining = _ai_calls_remaining()
-    if remaining is not None and remaining <= 0:
-        return False
-    st.session_state["ai_calls_used"] = _ai_calls_used() + 1
-    return True
  
  
 # --------------------------------------------------------------------------- #
@@ -224,12 +251,12 @@ def _call(model, prompt, system, max_tokens=700):
     client = get_ai_client()
     if client is None:
         return {"ok": False, "text": "⚠️ AI is not configured. Set GROQ_API_KEY in your environment."}
-    if not _consume_ai_call():
+    if not check_ai_quota():
         return {
             "ok": False,
             "text": (
-                "⚠️ AI session quota reached for this session. "
-                "Refresh or restart the app session to continue."
+                "⚠️ You have reached your limit of 5 free AI queries for today. "
+                "Please upgrade to continue using unlimited AI features."
             ),
         }
     try:
@@ -240,6 +267,7 @@ def _call(model, prompt, system, max_tokens=700):
             temperature=0.7,
             max_tokens=max_tokens,
         )
+        increment_ai_quota()
         return {"ok": True, "text": resp.choices[0].message.content or ""}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "text": f"⚠️ Could not reach Groq: {exc}"}
@@ -3334,12 +3362,10 @@ def main():
     model = DEFAULT_MODEL
     if not ai_ready(model):
         st.sidebar.warning("AI features are off (no key set) — video + notes still work.")
-    elif AI_SESSION_LIMIT > 0:
-        used = _ai_calls_used()
-        remaining = _ai_calls_remaining()
-        st.sidebar.caption(f"AI session quota: {used}/{AI_SESSION_LIMIT} used ({remaining} left)")
     else:
-        st.sidebar.caption("AI session quota: unlimited")
+        role_usage = get_ai_usage_count(role=role)
+        remaining = max(DAILY_AI_QUOTA - role_usage, 0)
+        st.sidebar.caption(f"AI daily quota ({role}): {role_usage}/{DAILY_AI_QUOTA} used ({remaining} left)")
     st.sidebar.caption(f"{len(load_index())} lecture(s) available.")
 
     if role == "Teacher":
