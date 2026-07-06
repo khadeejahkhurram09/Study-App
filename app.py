@@ -10,49 +10,6 @@ from datetime import datetime
  
 import streamlit as st
 
-def check_password(prompt_key="default"):
-    """Returns True if the user has the correct password."""
-    if "password_correct" not in st.session_state:
-        st.session_state["password_correct"] = False
-
-    if st.session_state["password_correct"]:
-        return True
-
-    # Main welcome header
-    st.title("🌊 Scholarwave Hub AI")
-    
-    # Split the screen into two columns: one for logging in, one for instructions
-    col1, col2 = st.columns([2, 1.5])
-    
-    with col1:
-        st.subheader("🔑 Unlock AI Features")
-        user_password = st.text_input(
-            "Enter Access Key",
-            type="password",
-            key=f"access_key_input_{prompt_key}",
-        )
-        if st.button("Unlock AI Assistant", key=f"access_key_btn_{prompt_key}"):
-            if user_password == "scholarwave2026":
-                st.session_state["password_correct"] = True
-                st.rerun()
-            else:
-                st.error("❌ Invalid Access Key.")
-                
-    with col2:
-        st.subheader("📢 How to get an Access Key?")
-        st.info(
-            """
-            **Students & Teachers:** If you are new to Scholarwave Hub, you can get your free beta testing key instantly by:
-            * 📨 Checking the pin in our school WhatsApp group.
-            * 🏫 Asking your computer science or subject teacher.
-            * ✉️ Dropping a quick email to: `yourname@email.com`
-            """
-        )
-    return False
-
-# Drop this inside the specific page or tab where your AI code lives!
-# if not check_password():
-#     st.stop()
 from dotenv import load_dotenv
 from groq import Groq
  
@@ -104,6 +61,10 @@ VIDEO_TYPES = ["mp4", "mov", "webm", "m4v"]
 # --------------------------------------------------------------------------- #
 GROQ_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_MODEL = "Groq"
+try:
+    AI_SESSION_LIMIT = int(os.environ.get("AI_SESSION_LIMIT", "60"))
+except ValueError:
+    AI_SESSION_LIMIT = 60
 
 
 def get_ai_client():
@@ -115,6 +76,26 @@ def get_ai_client():
 
 def ai_ready(model):
     return get_ai_client() is not None
+
+
+def _ai_calls_used():
+    return int(st.session_state.get("ai_calls_used", 0))
+
+
+def _ai_calls_remaining():
+    if AI_SESSION_LIMIT <= 0:
+        return None
+    return max(AI_SESSION_LIMIT - _ai_calls_used(), 0)
+
+
+def _consume_ai_call():
+    if AI_SESSION_LIMIT <= 0:
+        return True
+    remaining = _ai_calls_remaining()
+    if remaining is not None and remaining <= 0:
+        return False
+    st.session_state["ai_calls_used"] = _ai_calls_used() + 1
+    return True
  
  
 # --------------------------------------------------------------------------- #
@@ -243,6 +224,14 @@ def _call(model, prompt, system, max_tokens=700):
     client = get_ai_client()
     if client is None:
         return {"ok": False, "text": "⚠️ AI is not configured. Set GROQ_API_KEY in your environment."}
+    if not _consume_ai_call():
+        return {
+            "ok": False,
+            "text": (
+                "⚠️ AI session quota reached for this session. "
+                "Refresh or restart the app session to continue."
+            ),
+        }
     try:
         resp = client.chat.completions.create(
             model=GROQ_MODEL,
@@ -2515,145 +2504,141 @@ def _render_study_modes(model, subject_name, grade_level=None):
     tab_boss, tab_eli5, tab_map, tab_sheet = st.tabs(["⚔️ Boss Battle", "🧒 ELI5", "🧩 Concept map", "📋 Cheat sheet"])
 
     with tab_boss:
-        if check_password("study_boss"):
-            if not ai_ready(model):
-                st.info("Study-mode AI tools need the AI endpoint configured.")
-            else:
-                if st.button("Start Boss Battle", type="primary", key="boss_battle_btn"):
-                    with st.spinner("Building your challenge…"):
-                        st.session_state["boss_battle_data"] = generate_boss_battle_challenge(model, subject_name, grade_level, topic)
-                        st.session_state["boss_battle_answers"] = {}
-                        st.session_state["boss_battle_submitted"] = False
+        if not ai_ready(model):
+            st.info("Study-mode AI tools need the AI endpoint configured.")
+        else:
+            if st.button("Start Boss Battle", type="primary", key="boss_battle_btn"):
+                with st.spinner("Building your challenge…"):
+                    st.session_state["boss_battle_data"] = generate_boss_battle_challenge(model, subject_name, grade_level, topic)
+                    st.session_state["boss_battle_answers"] = {}
+                    st.session_state["boss_battle_submitted"] = False
 
-                if st.session_state.get("boss_battle_data"):
-                    data = st.session_state["boss_battle_data"]
-                    questions = data.get("questions", [])
-                    final_mission = data.get("final_mission", "")
+            if st.session_state.get("boss_battle_data"):
+                data = st.session_state["boss_battle_data"]
+                questions = data.get("questions", [])
+                final_mission = data.get("final_mission", "")
 
-                    if not questions:
-                        st.info(final_mission)
-                    else:
-                        st.markdown(f"### ⚔️ Boss Battle Challenge")
-                        st.caption(f"Topic: {topic}")
+                if not questions:
+                    st.info(final_mission)
+                else:
+                    st.markdown(f"### ⚔️ Boss Battle Challenge")
+                    st.caption(f"Topic: {topic}")
 
+                    for i, q in enumerate(questions):
+                        st.markdown(f"**Q{i+1}. {q.get('question', '')}**")
+                        options = q.get("options", [])
+                        if options:
+                            answer = st.radio("Select your answer:", options, key=f"boss_q_{i}", index=None)
+                            st.session_state["boss_battle_answers"][i] = answer
+
+                    if st.button("Submit Answers", type="primary", key="boss_submit"):
+                        st.session_state["boss_battle_submitted"] = True
+
+                    if st.session_state.get("boss_battle_submitted"):
+                        correct = 0
                         for i, q in enumerate(questions):
-                            st.markdown(f"**Q{i+1}. {q.get('question', '')}**")
-                            options = q.get("options", [])
-                            if options:
-                                answer = st.radio("Select your answer:", options, key=f"boss_q_{i}", index=None)
-                                st.session_state["boss_battle_answers"][i] = answer
+                            user_answer = st.session_state["boss_battle_answers"].get(i)
+                            correct_answer = q["options"][q.get("correct_index", 0)]
+                            is_correct = user_answer == correct_answer
+                            if is_correct:
+                                correct += 1
 
-                        if st.button("Submit Answers", type="primary", key="boss_submit"):
-                            st.session_state["boss_battle_submitted"] = True
+                            st.markdown(f"**Q{i+1} Result:** {'✅ Correct!' if is_correct else '❌ Incorrect'}")
+                            if not is_correct:
+                                st.caption(f"💡 Hint: {q.get('hint', 'No hint available')}")
+                                st.info(f"📚 Explanation: {q.get('explanation', 'No explanation available')}")
 
-                        if st.session_state.get("boss_battle_submitted"):
-                            correct = 0
-                            for i, q in enumerate(questions):
-                                user_answer = st.session_state["boss_battle_answers"].get(i)
-                                correct_answer = q["options"][q.get("correct_index", 0)]
-                                is_correct = user_answer == correct_answer
-                                if is_correct:
-                                    correct += 1
+                        st.markdown(f"### Score: {correct}/{len(questions)}")
+                        if correct == len(questions):
+                            st.balloons()
+                            st.success("🎉 Perfect! You defeated the boss!")
+                        else:
+                            st.warning(f"You got {correct} out of {len(questions)} correct. Keep practicing!")
 
-                                st.markdown(f"**Q{i+1} Result:** {'✅ Correct!' if is_correct else '❌ Incorrect'}")
-                                if not is_correct:
-                                    st.caption(f"💡 Hint: {q.get('hint', 'No hint available')}")
-                                    st.info(f"📚 Explanation: {q.get('explanation', 'No explanation available')}")
-
-                            st.markdown(f"### Score: {correct}/{len(questions)}")
-                            if correct == len(questions):
-                                st.balloons()
-                                st.success("🎉 Perfect! You defeated the boss!")
-                            else:
-                                st.warning(f"You got {correct} out of {len(questions)} correct. Keep practicing!")
-
-                            st.markdown(f"### 🏆 Final Mission")
-                            st.markdown(final_mission)
+                        st.markdown(f"### 🏆 Final Mission")
+                        st.markdown(final_mission)
 
     with tab_eli5:
-        if check_password("study_eli5"):
-            if not ai_ready(model):
-                st.info("Study-mode AI tools need the AI endpoint configured.")
-            else:
-                explanation = st.text_area("Paste the explanation you want simplified", height=140, placeholder="Write a short explanation here…")
-                if st.button("Make it ELI5", key="eli5_btn"):
-                    if explanation.strip():
-                        with st.spinner("Simplifying your explanation…"):
-                            st.session_state["eli5_output"] = simplify_for_eli5(model, subject_name, topic, explanation)
-                        st.markdown(st.session_state["eli5_output"])
-                    else:
-                        st.warning("Please enter a short explanation to simplify.")
+        if not ai_ready(model):
+            st.info("Study-mode AI tools need the AI endpoint configured.")
+        else:
+            explanation = st.text_area("Paste the explanation you want simplified", height=140, placeholder="Write a short explanation here…")
+            if st.button("Make it ELI5", key="eli5_btn"):
+                if explanation.strip():
+                    with st.spinner("Simplifying your explanation…"):
+                        st.session_state["eli5_output"] = simplify_for_eli5(model, subject_name, topic, explanation)
+                    st.markdown(st.session_state["eli5_output"])
+                else:
+                    st.warning("Please enter a short explanation to simplify.")
 
     with tab_map:
-        if check_password("study_map"):
-            if not ai_ready(model):
-                st.info("Study-mode AI tools need the AI endpoint configured.")
-            else:
-                related_topic = st.text_input("Related concept", placeholder="e.g. respiration", key="concept_map_topic")
-                if st.button("Weave the concept map", key="concept_map_btn"):
-                    if related_topic.strip():
-                        with st.spinner("Connecting the concepts…"):
-                            st.session_state["concept_map_data"] = connect_concepts(model, subject_name, topic, related_topic)
-                    else:
-                        st.warning("Please enter a related concept.")
+        if not ai_ready(model):
+            st.info("Study-mode AI tools need the AI endpoint configured.")
+        else:
+            related_topic = st.text_input("Related concept", placeholder="e.g. respiration", key="concept_map_topic")
+            if st.button("Weave the concept map", key="concept_map_btn"):
+                if related_topic.strip():
+                    with st.spinner("Connecting the concepts…"):
+                        st.session_state["concept_map_data"] = connect_concepts(model, subject_name, topic, related_topic)
+                else:
+                    st.warning("Please enter a related concept.")
 
-                if st.session_state.get("concept_map_data"):
-                    data = st.session_state["concept_map_data"]
-                    central_topic = data.get("central_topic", topic)
-                    connections = data.get("connections", [])
-                    key_points = data.get("key_points", [])
+            if st.session_state.get("concept_map_data"):
+                data = st.session_state["concept_map_data"]
+                central_topic = data.get("central_topic", topic)
+                connections = data.get("connections", [])
+                key_points = data.get("key_points", [])
 
-                    # Visual concept map as blocks
-                    st.markdown("### 🧩 Visual Concept Map")
+                # Visual concept map as blocks
+                st.markdown("### 🧩 Visual Concept Map")
 
-                    # Central topic block
-                    st.markdown(f"""
-                    <div style="background: linear-gradient(135deg, #ffd9a8, #b6f1d8); color: #1b2733; padding: 1rem; border-radius: 12px; text-align: center; font-weight: 700; font-size: 1.2rem; margin: 1rem 0; border: 1px solid #9ed9c0;">
-                        {central_topic}
-                    </div>
-                    """, unsafe_allow_html=True)
+                # Central topic block
+                st.markdown(f"""
+                <div style="background: linear-gradient(135deg, #ffd9a8, #b6f1d8); color: #1b2733; padding: 1rem; border-radius: 12px; text-align: center; font-weight: 700; font-size: 1.2rem; margin: 1rem 0; border: 1px solid #9ed9c0;">
+                    {central_topic}
+                </div>
+                """, unsafe_allow_html=True)
 
-                    # Connection blocks
-                    if connections:
-                        for i, conn in enumerate(connections):
-                            from_topic = conn.get("from", "")
-                            to_topic = conn.get("to", "")
-                            relationship = conn.get("relationship", "")
+                # Connection blocks
+                if connections:
+                    for i, conn in enumerate(connections):
+                        from_topic = conn.get("from", "")
+                        to_topic = conn.get("to", "")
+                        relationship = conn.get("relationship", "")
 
-                            st.markdown(f"""
-                            <div style="display: flex; align-items: center; margin: 0.8rem 0;">
-                                <div style="background: #ffffff; color: #13293d; border: 2px solid #5d9dd8; padding: 0.8rem; border-radius: 10px; flex: 1; text-align: center; font-weight: 600;">
-                                    {from_topic}
-                                </div>
-                                <div style="flex: 0 0 100px; text-align: center; color: #1d4f73; font-weight: bold; font-size: 0.9rem;">
-                                    → {relationship} →
-                                </div>
-                                <div style="background: #ffffff; color: #13293d; border: 2px solid #4fc08d; padding: 0.8rem; border-radius: 10px; flex: 1; text-align: center; font-weight: 600;">
-                                    {to_topic}
-                                </div>
+                        st.markdown(f"""
+                        <div style="display: flex; align-items: center; margin: 0.8rem 0;">
+                            <div style="background: #ffffff; color: #13293d; border: 2px solid #5d9dd8; padding: 0.8rem; border-radius: 10px; flex: 1; text-align: center; font-weight: 600;">
+                                {from_topic}
                             </div>
-                            """, unsafe_allow_html=True)
-
-                    # Key points
-                    if key_points:
-                        st.markdown("### 📌 Key Points")
-                        for point in key_points:
-                            st.markdown(f"""
-                            <div style="background: #f9fcff; color: #13293d; border-left: 4px solid #2f80ed; padding: 0.8rem; margin: 0.5rem 0; border-radius: 4px;">
-                                {point}
+                            <div style="flex: 0 0 100px; text-align: center; color: #1d4f73; font-weight: bold; font-size: 0.9rem;">
+                                → {relationship} →
                             </div>
-                            """, unsafe_allow_html=True)
+                            <div style="background: #ffffff; color: #13293d; border: 2px solid #4fc08d; padding: 0.8rem; border-radius: 10px; flex: 1; text-align: center; font-weight: 600;">
+                                {to_topic}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                # Key points
+                if key_points:
+                    st.markdown("### 📌 Key Points")
+                    for point in key_points:
+                        st.markdown(f"""
+                        <div style="background: #f9fcff; color: #13293d; border-left: 4px solid #2f80ed; padding: 0.8rem; margin: 0.5rem 0; border-radius: 4px;">
+                            {point}
+                        </div>
+                        """, unsafe_allow_html=True)
 
     with tab_sheet:
-        if check_password("study_sheet"):
-            if not ai_ready(model):
-                st.info("Study-mode AI tools need the AI endpoint configured.")
-            else:
-                if st.button("Generate cheat sheet", type="primary", key="cheat_sheet_btn"):
-                    with st.spinner("Creating your revision sheet…"):
-                        st.session_state["cheat_sheet_output"] = generate_cheat_sheet(model, subject_name, topic)
-                if st.session_state.get("cheat_sheet_output"):
-                    st.markdown(st.session_state["cheat_sheet_output"])
+        if not ai_ready(model):
+            st.info("Study-mode AI tools need the AI endpoint configured.")
+        else:
+            if st.button("Generate cheat sheet", type="primary", key="cheat_sheet_btn"):
+                with st.spinner("Creating your revision sheet…"):
+                    st.session_state["cheat_sheet_output"] = generate_cheat_sheet(model, subject_name, topic)
+            if st.session_state.get("cheat_sheet_output"):
+                st.markdown(st.session_state["cheat_sheet_output"])
 
 
 def _play_lecture(lec, model, active_subject, grade_level=None):
@@ -2678,17 +2663,16 @@ def _play_lecture(lec, model, active_subject, grade_level=None):
                 st.info(st.session_state[f"summary_{lec['id']}"])
 
     with tab_ai:
-        if check_password(f"lecture_ai_{lec['id']}"):
-            if not ai_ready(model):
-                st.info("The AI tutor isn't configured in this environment.")
-            else:
-                q = st.text_input("Ask anything about this lecture",
-                                  key=f"q_{lec['id']}", placeholder="e.g. Why is chlorophyll important?")
-                if st.button("Ask AI tutor", key=f"ask_{lec['id']}", type="primary") and q.strip():
-                    with st.spinner("Thinking…"):
-                        st.session_state[f"ans_{lec['id']}"] = ask_tutor(model, lec, q)
-                if st.session_state.get(f"ans_{lec['id']}"):
-                    st.markdown(st.session_state[f"ans_{lec['id']}"])
+        if not ai_ready(model):
+            st.info("The AI tutor isn't configured in this environment.")
+        else:
+            q = st.text_input("Ask anything about this lecture",
+                              key=f"q_{lec['id']}", placeholder="e.g. Why is chlorophyll important?")
+            if st.button("Ask AI tutor", key=f"ask_{lec['id']}", type="primary") and q.strip():
+                with st.spinner("Thinking…"):
+                    st.session_state[f"ans_{lec['id']}"] = ask_tutor(model, lec, q)
+            if st.session_state.get(f"ans_{lec['id']}"):
+                st.markdown(st.session_state[f"ans_{lec['id']}"])
 
     with tab_teacher:
         st.caption("Send a question directly to your teacher about this lecture or topic.")
@@ -3288,13 +3272,17 @@ def main():
     model = DEFAULT_MODEL
     if not ai_ready(model):
         st.sidebar.warning("AI features are off (no key set) — video + notes still work.")
+    elif AI_SESSION_LIMIT > 0:
+        used = _ai_calls_used()
+        remaining = _ai_calls_remaining()
+        st.sidebar.caption(f"AI session quota: {used}/{AI_SESSION_LIMIT} used ({remaining} left)")
+    else:
+        st.sidebar.caption("AI session quota: unlimited")
     st.sidebar.caption(f"{len(load_index())} lecture(s) available.")
 
     if role == "Teacher":
-        # Check password first so the teacher dashboard stays hidden until unlocked.
-        if check_password("teacher_dashboard"):
-            st.title("👩‍🏫 Teacher dashboard")
-            teacher_view(model)
+        st.title("👩‍🏫 Teacher dashboard")
+        teacher_view(model)
     else:
         st.title("🎯 Study smarter")
         st.caption("Pick a subject, watch the lecture, and let your AI tutor make revision feel lighter and brighter.")
