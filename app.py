@@ -10,7 +10,7 @@ from datetime import datetime
  
 import streamlit as st
 
-def check_password():
+def check_password(prompt_key="default"):
     """Returns True if the user has the correct password."""
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
@@ -26,8 +26,12 @@ def check_password():
     
     with col1:
         st.subheader("🔑 Unlock AI Features")
-        user_password = st.text_input("Enter Access Key", type="password")
-        if st.button("Unlock AI Assistant"):
+        user_password = st.text_input(
+            "Enter Access Key",
+            type="password",
+            key=f"access_key_input_{prompt_key}",
+        )
+        if st.button("Unlock AI Assistant", key=f"access_key_btn_{prompt_key}"):
             if user_password == "scholarwave2026":
                 st.session_state["password_correct"] = True
                 st.rerun()
@@ -2511,7 +2515,7 @@ def _render_study_modes(model, subject_name, grade_level=None):
     tab_boss, tab_eli5, tab_map, tab_sheet = st.tabs(["⚔️ Boss Battle", "🧒 ELI5", "🧩 Concept map", "📋 Cheat sheet"])
 
     with tab_boss:
-        if check_password():
+        if check_password("study_boss"):
             if not ai_ready(model):
                 st.info("Study-mode AI tools need the AI endpoint configured.")
             else:
@@ -2567,7 +2571,7 @@ def _render_study_modes(model, subject_name, grade_level=None):
                             st.markdown(final_mission)
 
     with tab_eli5:
-        if check_password():
+        if check_password("study_eli5"):
             if not ai_ready(model):
                 st.info("Study-mode AI tools need the AI endpoint configured.")
             else:
@@ -2581,7 +2585,7 @@ def _render_study_modes(model, subject_name, grade_level=None):
                         st.warning("Please enter a short explanation to simplify.")
 
     with tab_map:
-        if check_password():
+        if check_password("study_map"):
             if not ai_ready(model):
                 st.info("Study-mode AI tools need the AI endpoint configured.")
             else:
@@ -2641,7 +2645,7 @@ def _render_study_modes(model, subject_name, grade_level=None):
                             """, unsafe_allow_html=True)
 
     with tab_sheet:
-        if check_password():
+        if check_password("study_sheet"):
             if not ai_ready(model):
                 st.info("Study-mode AI tools need the AI endpoint configured.")
             else:
@@ -2674,7 +2678,7 @@ def _play_lecture(lec, model, active_subject, grade_level=None):
                 st.info(st.session_state[f"summary_{lec['id']}"])
 
     with tab_ai:
-        if check_password():
+        if check_password(f"lecture_ai_{lec['id']}"):
             if not ai_ready(model):
                 st.info("The AI tutor isn't configured in this environment.")
             else:
@@ -3289,7 +3293,7 @@ def main():
     if role == "Teacher":
         st.title("👩‍🏫 Teacher dashboard")
         # Secure it: Only open if the passcode matches.
-        if check_password():
+        if check_password("teacher_dashboard"):
             teacher_view(model)
     else:
         st.title("🎯 Study smarter")
