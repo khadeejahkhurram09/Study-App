@@ -13,6 +13,7 @@ import streamlit as st
 
 from dotenv import load_dotenv
 from groq import Groq
+from supabase import create_client, Client
 
 
 DAILY_AI_QUOTA = 10
@@ -56,60 +57,120 @@ def _parse_iso_date(value):
 
 def is_user_premium(role=None):
     active_role = role or st.session_state.get("role") or "Student"
+    row = None
     if active_role == "Student":
         sid = st.session_state.get("student_id")
         if not sid:
             return False
-        with get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT premium_until FROM students WHERE student_id = ?;", (sid,))
-            row = cursor.fetchone()
+        if supabase:
+            try:
+                response = supabase.table("students").select("premium_until").eq("student_id", sid).limit(1).execute()
+                records = response.data or []
+                row = records[0] if records else None
+            except Exception:
+                row = None
+        if row is None:
+            with get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT premium_until FROM students WHERE student_id = ?;", (sid,))
+                sqlite_row = cursor.fetchone()
+                row = {"premium_until": sqlite_row[0]} if sqlite_row else None
     else:
         tid = st.session_state.get("teacher_id")
         if not tid:
             return False
-        with get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT premium_until FROM teachers WHERE teacher_id = ?;", (tid,))
-            row = cursor.fetchone()
+        if supabase:
+            try:
+                response = supabase.table("teachers").select("premium_until").eq("teacher_id", tid).limit(1).execute()
+                records = response.data or []
+                row = records[0] if records else None
+            except Exception:
+                row = None
+        if row is None:
+            with get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT premium_until FROM teachers WHERE teacher_id = ?;", (tid,))
+                sqlite_row = cursor.fetchone()
+                row = {"premium_until": sqlite_row[0]} if sqlite_row else None
 
-    premium_until = _parse_iso_date(row[0]) if row else None
+    premium_until = _parse_iso_date(row.get("premium_until") if row else None)
     return bool(premium_until and premium_until >= _today_date())
 
 
 def get_user_premium_until(role=None):
     active_role = role or st.session_state.get("role") or "Student"
+    row = None
     if active_role == "Student":
         sid = st.session_state.get("student_id")
         if not sid:
             return None
-        with get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT premium_until FROM students WHERE student_id = ?;", (sid,))
-            row = cursor.fetchone()
+        if supabase:
+            try:
+                response = supabase.table("students").select("premium_until").eq("student_id", sid).limit(1).execute()
+                records = response.data or []
+                row = records[0] if records else None
+            except Exception:
+                row = None
+        if row is None:
+            with get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT premium_until FROM students WHERE student_id = ?;", (sid,))
+                sqlite_row = cursor.fetchone()
+                row = {"premium_until": sqlite_row[0]} if sqlite_row else None
     else:
         tid = st.session_state.get("teacher_id")
         if not tid:
             return None
-        with get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT premium_until FROM teachers WHERE teacher_id = ?;", (tid,))
-            row = cursor.fetchone()
+        if supabase:
+            try:
+                response = supabase.table("teachers").select("premium_until").eq("teacher_id", tid).limit(1).execute()
+                records = response.data or []
+                row = records[0] if records else None
+            except Exception:
+                row = None
+        if row is None:
+            with get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT premium_until FROM teachers WHERE teacher_id = ?;", (tid,))
+                sqlite_row = cursor.fetchone()
+                row = {"premium_until": sqlite_row[0]} if sqlite_row else None
 
-    return _parse_iso_date(row[0]) if row else None
+    return _parse_iso_date(row.get("premium_until") if row else None)
 
 
 def get_ai_usage_count(role=None):
     active_role, user_identifier = _resolve_ai_usage_identity(role=role)
     usage_date = _current_quota_date()
-    with get_conn() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT questions_asked FROM user_ai_usage WHERE user_role = ? AND user_identifier = ? AND usage_date = ?;",
-            (active_role, user_identifier, usage_date),
-        )
-        row = cursor.fetchone()
-    count = int(row[0]) if row else 0
+    count = 0
+    use_sqlite_fallback = not supabase
+
+    if supabase:
+        try:
+            response = (
+                supabase.table("user_ai_usage")
+                .select("questions_asked")
+                .eq("user_role", active_role)
+                .eq("user_identifier", user_identifier)
+                .eq("usage_date", usage_date)
+                .limit(1)
+                .execute()
+            )
+            records = response.data or []
+            if records:
+                count = int(records[0].get("questions_asked") or 0)
+        except Exception:
+            use_sqlite_fallback = True
+
+    if use_sqlite_fallback:
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT questions_asked FROM user_ai_usage WHERE user_role = ? AND user_identifier = ? AND usage_date = ?;",
+                (active_role, user_identifier, usage_date),
+            )
+            row = cursor.fetchone()
+            count = int(row[0]) if row else 0
+
     st.session_state["ai_questions_asked"] = count
     return count
 
@@ -135,31 +196,82 @@ def check_ai_quota(role=None, show_paywall=True):
     return True
 
 
-def increment_ai_quota(role=None):
+def increment_ai_usage(role=None):
     active_role, user_identifier = _resolve_ai_usage_identity(role=role)
     usage_date = _current_quota_date()
-    with get_conn() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO user_ai_usage (user_role, user_identifier, usage_date, questions_asked)
-            VALUES (?, ?, ?, 1)
-            ON CONFLICT(user_role, user_identifier, usage_date)
-            DO UPDATE SET questions_asked = questions_asked + 1, updated_at = CURRENT_TIMESTAMP;
-            """,
-            (active_role, user_identifier, usage_date),
-        )
-        cursor.execute(
-            "SELECT questions_asked FROM user_ai_usage WHERE user_role = ? AND user_identifier = ? AND usage_date = ?;",
-            (active_role, user_identifier, usage_date),
-        )
-        row = cursor.fetchone()
-        conn.commit()
-    count = int(row[0]) if row else 0
+    count = 0
+    use_sqlite_fallback = not supabase
+
+    if supabase:
+        try:
+            current = (
+                supabase.table("user_ai_usage")
+                .select("usage_id, questions_asked")
+                .eq("user_role", active_role)
+                .eq("user_identifier", user_identifier)
+                .eq("usage_date", usage_date)
+                .limit(1)
+                .execute()
+            )
+            records = current.data or []
+            if records:
+                current_row = records[0]
+                count = int(current_row.get("questions_asked") or 0) + 1
+                (
+                    supabase.table("user_ai_usage")
+                    .update({"questions_asked": count, "updated_at": datetime.now().isoformat(timespec="seconds")})
+                    .eq("usage_id", current_row.get("usage_id"))
+                    .execute()
+                )
+            else:
+                insert_resp = (
+                    supabase.table("user_ai_usage")
+                    .insert({
+                        "user_role": active_role,
+                        "user_identifier": user_identifier,
+                        "usage_date": usage_date,
+                        "questions_asked": 1,
+                    })
+                    .execute()
+                )
+                inserted = insert_resp.data or []
+                count = int(inserted[0].get("questions_asked") or 1) if inserted else 1
+        except Exception:
+            use_sqlite_fallback = True
+
+    if use_sqlite_fallback:
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO user_ai_usage (user_role, user_identifier, usage_date, questions_asked)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(user_role, user_identifier, usage_date)
+                DO UPDATE SET questions_asked = questions_asked + 1, updated_at = CURRENT_TIMESTAMP;
+                """,
+                (active_role, user_identifier, usage_date),
+            )
+            cursor.execute(
+                "SELECT questions_asked FROM user_ai_usage WHERE user_role = ? AND user_identifier = ? AND usage_date = ?;",
+                (active_role, user_identifier, usage_date),
+            )
+            row = cursor.fetchone()
+            conn.commit()
+            count = int(row[0]) if row else 0
+
     st.session_state["ai_questions_asked"] = count
     return count
+
+
+def increment_ai_quota(role=None):
+    return increment_ai_usage(role=role)
  
 load_dotenv()
+
+supabase_url = os.environ.get("SUPABASE_URL")
+supabase_key = os.environ.get("SUPABASE_KEY")
+# Only use supabase if keys are present; fallback gracefully when unavailable.
+supabase: Client = create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
  
 # --------------------------------------------------------------------------- #
 # Storage + config
@@ -928,6 +1040,21 @@ def get_student_teacher_questions(student_id):
 def save_suggestion(user_role, user_name, user_email, category, message):
     if not category or not message.strip():
         return False
+    payload = {
+        "user_role": user_role,
+        "user_name": user_name,
+        "user_email": user_email,
+        "category": category,
+        "message": message.strip(),
+    }
+
+    if supabase:
+        try:
+            supabase.table("suggestions").insert(payload).execute()
+            return True
+        except Exception:
+            pass
+
     with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -939,6 +1066,19 @@ def save_suggestion(user_role, user_name, user_email, category, message):
 
 
 def get_recent_suggestions(limit=50):
+    if supabase:
+        try:
+            response = (
+                supabase.table("suggestions")
+                .select("suggestion_id, user_role, user_name, user_email, category, message, created_at")
+                .order("created_at", desc=True)
+                .limit(int(limit))
+                .execute()
+            )
+            return response.data or []
+        except Exception:
+            pass
+
     with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -946,10 +1086,38 @@ def get_recent_suggestions(limit=50):
             (int(limit),),
         )
         rows = cursor.fetchall()
-    return rows
+    normalized = []
+    for row in rows:
+        normalized.append({
+            "suggestion_id": row[0],
+            "user_role": row[1],
+            "user_name": row[2],
+            "user_email": row[3],
+            "category": row[4],
+            "message": row[5],
+            "created_at": row[6],
+        })
+    return normalized
 
 
 def save_payment_request(user_role, user_identifier, user_name, user_email, reference, note):
+    payload = {
+        "user_role": user_role,
+        "user_identifier": user_identifier,
+        "user_name": user_name,
+        "user_email": user_email,
+        "reference": (reference or "").strip(),
+        "note": (note or "").strip(),
+        "status": "pending",
+    }
+
+    if supabase:
+        try:
+            supabase.table("payment_requests").insert(payload).execute()
+            return True
+        except Exception:
+            pass
+
     with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -961,6 +1129,19 @@ def save_payment_request(user_role, user_identifier, user_name, user_email, refe
 
 
 def get_payment_requests(limit=50):
+    if supabase:
+        try:
+            response = (
+                supabase.table("payment_requests")
+                .select("request_id, user_role, user_identifier, user_name, user_email, reference, note, status, reviewed_by, reviewed_note, reviewed_at, created_at")
+                .order("created_at", desc=True)
+                .limit(int(limit))
+                .execute()
+            )
+            return response.data or []
+        except Exception:
+            pass
+
     with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -968,10 +1149,43 @@ def get_payment_requests(limit=50):
             (int(limit),),
         )
         rows = cursor.fetchall()
-    return rows
+    normalized = []
+    for row in rows:
+        normalized.append({
+            "request_id": row[0],
+            "user_role": row[1],
+            "user_identifier": row[2],
+            "user_name": row[3],
+            "user_email": row[4],
+            "reference": row[5],
+            "note": row[6],
+            "status": row[7],
+            "reviewed_by": row[8],
+            "reviewed_note": row[9],
+            "reviewed_at": row[10],
+            "created_at": row[11],
+        })
+    return normalized
 
 
 def update_payment_request_status(request_id, status, reviewed_by=None, reviewed_note=None):
+    if supabase:
+        try:
+            (
+                supabase.table("payment_requests")
+                .update({
+                    "status": status,
+                    "reviewed_by": reviewed_by,
+                    "reviewed_note": reviewed_note,
+                    "reviewed_at": datetime.now().isoformat(timespec="seconds"),
+                })
+                .eq("request_id", request_id)
+                .execute()
+            )
+            return True
+        except Exception:
+            pass
+
     with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -989,7 +1203,62 @@ def update_payment_request_status(request_id, status, reviewed_by=None, reviewed
 def grant_premium_access(user_role, user_identifier=None, user_email=None, days=PREMIUM_DAYS_DEFAULT):
     duration = max(int(days or PREMIUM_DAYS_DEFAULT), 1)
     today = _today_date()
-    target_date = today + timedelta(days=duration)
+    if supabase:
+        try:
+            if user_role == "Student":
+                student_id = None
+                if user_identifier and str(user_identifier).startswith("student:"):
+                    try:
+                        student_id = int(str(user_identifier).split(":", 1)[1])
+                    except ValueError:
+                        student_id = None
+
+                row = None
+                if student_id is not None:
+                    response = supabase.table("students").select("student_id, premium_until").eq("student_id", student_id).limit(1).execute()
+                    records = response.data or []
+                    row = records[0] if records else None
+                elif user_email:
+                    response = supabase.table("students").select("student_id, premium_until").eq("email", user_email).order("student_id", desc=True).limit(1).execute()
+                    records = response.data or []
+                    row = records[0] if records else None
+
+                if not row:
+                    return False, "Student account not found."
+
+                current_until = _parse_iso_date(row.get("premium_until"))
+                base_date = current_until if current_until and current_until > today else today
+                new_until = base_date + timedelta(days=duration)
+                supabase.table("students").update({"premium_until": new_until.isoformat()}).eq("student_id", row.get("student_id")).execute()
+            else:
+                teacher_id = None
+                if user_identifier and str(user_identifier).startswith("teacher:"):
+                    try:
+                        teacher_id = int(str(user_identifier).split(":", 1)[1])
+                    except ValueError:
+                        teacher_id = None
+
+                row = None
+                if teacher_id is not None:
+                    response = supabase.table("teachers").select("teacher_id, premium_until").eq("teacher_id", teacher_id).limit(1).execute()
+                    records = response.data or []
+                    row = records[0] if records else None
+                elif user_email:
+                    response = supabase.table("teachers").select("teacher_id, premium_until").eq("email", user_email).order("teacher_id", desc=True).limit(1).execute()
+                    records = response.data or []
+                    row = records[0] if records else None
+
+                if not row:
+                    return False, "Teacher account not found."
+
+                current_until = _parse_iso_date(row.get("premium_until"))
+                base_date = current_until if current_until and current_until > today else today
+                new_until = base_date + timedelta(days=duration)
+                supabase.table("teachers").update({"premium_until": new_until.isoformat()}).eq("teacher_id", row.get("teacher_id")).execute()
+
+            return True, f"Premium active until {new_until.isoformat()}"
+        except Exception:
+            pass
 
     with get_conn() as conn:
         cursor = conn.cursor()
@@ -2559,7 +2828,7 @@ def teacher_view(model):
             st.session_state.pop(key, None)
         st.rerun()
 
-    tab_profile, tab_upload, tab_flashcards, tab_assessments, tab_to_check, tab_resources, tab_questions = st.tabs([
+    tab_profile, tab_upload, tab_flashcards, tab_assessments, tab_to_check, tab_resources, tab_questions, tab_admin = st.tabs([
         "🏫 My classes & subjects",
         "📤 Upload lecture",
         "🧠 Manage flashcards",
@@ -2567,6 +2836,7 @@ def teacher_view(model):
         "✅ To be checked",
         "📚 Resources",
         "💬 Student questions",
+        "⚙️ Admin & Billing",
     ])
 
     with tab_profile:
@@ -2765,6 +3035,97 @@ def teacher_view(model):
                             save_teacher_question_answer(question_id, reply, st.session_state.get("teacher_name", "Teacher"))
                             st.success("Reply saved.")
                 st.divider()
+
+    with tab_admin:
+        st.subheader("⚙️ Admin & Billing")
+        st.caption("Review pending premium payments and recent student feedback.")
+
+        if not supabase:
+            st.warning("Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY to enable cloud admin workflows.")
+
+        pending_requests = []
+        feedback_items = []
+        if supabase:
+            try:
+                pending_response = (
+                    supabase.table("payment_requests")
+                    .select("request_id, user_role, user_identifier, user_name, user_email, reference, note, status, created_at")
+                    .eq("status", "pending")
+                    .order("created_at", desc=True)
+                    .limit(200)
+                    .execute()
+                )
+                pending_requests = pending_response.data or []
+            except Exception as exc:
+                st.error(f"Could not load pending payments from Supabase: {exc}")
+
+            try:
+                feedback_response = (
+                    supabase.table("suggestions")
+                    .select("suggestion_id, user_role, user_name, user_email, category, message, created_at")
+                    .order("created_at", desc=True)
+                    .limit(200)
+                    .execute()
+                )
+                feedback_items = feedback_response.data or []
+            except Exception as exc:
+                st.error(f"Could not load feedback from Supabase: {exc}")
+        else:
+            pending_requests = [
+                req for req in get_payment_requests(limit=200)
+                if str(req.get("status") or "").lower() == "pending"
+            ]
+            feedback_items = get_recent_suggestions(limit=200)
+
+        st.markdown("#### Pending premium approvals")
+        if not pending_requests:
+            st.info("No pending payment requests right now.")
+        else:
+            for request in pending_requests:
+                request_id = request.get("request_id")
+                user_name = request.get("user_name") or "Unknown user"
+                user_role = request.get("user_role") or "Student"
+                created_at = request.get("created_at") or ""
+                with st.expander(f"{user_name} · {user_role} · {created_at}"):
+                    st.write(f"Reference: {request.get('reference') or 'N/A'}")
+                    st.write(f"Identifier: {request.get('user_identifier') or 'N/A'}")
+                    st.write(f"Email: {request.get('user_email') or 'N/A'}")
+                    if request.get("note"):
+                        st.caption(request.get("note"))
+
+                    approve_key = f"approve_payment_{request_id}"
+                    if st.button("Approve pending premium key", key=approve_key, type="primary"):
+                        ok, message = grant_premium_access(
+                            request.get("user_role") or "Student",
+                            user_identifier=request.get("user_identifier"),
+                            user_email=request.get("user_email"),
+                            days=PREMIUM_DAYS_DEFAULT,
+                        )
+                        if ok:
+                            reviewer = st.session_state.get("teacher_name") or "Admin"
+                            update_payment_request_status(
+                                request_id,
+                                "approved",
+                                reviewed_by=reviewer,
+                                reviewed_note="Approved in Admin & Billing tab",
+                            )
+                            st.success(message)
+                            st.rerun()
+                        else:
+                            st.error(message)
+
+        st.divider()
+        st.markdown("#### Student feedback inbox")
+        if not feedback_items:
+            st.info("No feedback entries yet.")
+        else:
+            for item in feedback_items:
+                category = item.get("category") or "Feedback"
+                user_name = item.get("user_name") or "Anonymous"
+                created_at = item.get("created_at") or ""
+                with st.expander(f"{category} · {user_name} · {created_at}"):
+                    st.write(item.get("message") or "")
+                    st.caption(f"Role: {item.get('user_role') or 'Unknown'} · Email: {item.get('user_email') or 'N/A'}")
  
  
 # --------------------------------------------------------------------------- #
@@ -3891,6 +4252,9 @@ def main():
         _render_study_streak_sidebar()
     
     model = DEFAULT_MODEL
+    if not supabase:
+        st.sidebar.info("Supabase is not configured. App is using local SQLite fallback for data storage.")
+
     if not ai_ready(model):
         st.sidebar.warning("AI features are off (no key set) — video + notes still work.")
     else:
