@@ -13,7 +13,13 @@ import streamlit as st
 
 from dotenv import load_dotenv
 from groq import Groq
-from supabase import create_client, Client
+from typing import Any
+
+try:
+    from supabase import create_client, Client
+except ImportError:
+    create_client = None
+    Client = Any
 
 
 DAILY_AI_QUOTA = 10
@@ -271,7 +277,7 @@ load_dotenv()
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_KEY")
 # Only use supabase if keys are present; fallback gracefully when unavailable.
-supabase: Client = create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
+supabase: Client = create_client(supabase_url, supabase_key) if create_client and supabase_url and supabase_key else None
  
 # --------------------------------------------------------------------------- #
 # Storage + config
