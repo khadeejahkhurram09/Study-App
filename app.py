@@ -20,6 +20,7 @@ PAYMENT_LINK = os.environ.get("SCHOLARWAVE_PAYMENT_LINK", "https://buy.stripe.co
 PAYMENT_CONTACT_EMAIL = os.environ.get("SCHOLARWAVE_PAYMENT_CONTACT_EMAIL", "billing@scholarwavehub.com")
 PAYMENT_CONTACT_PHONE = os.environ.get("SCHOLARWAVE_PAYMENT_CONTACT_PHONE", "+880-000-000000")
 PREMIUM_DAYS_DEFAULT = int(os.environ.get("SCHOLARWAVE_PREMIUM_DAYS", "30"))
+DEVELOPER_ACCESS_PASSWORD = os.environ.get("SCHOLARWAVE_DEVELOPER_PASSWORD", "change-this-password")
 
 
 def _current_quota_date():
@@ -2544,6 +2545,140 @@ def _render_mobile_install_prompt():
         st.components.v1.html(install_prompt_html, height=0)
 
 
+def _developer_mode_requested():
+    dev_value = str(st.query_params.get("dev", "")).strip().lower()
+    return dev_value in {"1", "true", "yes", "on"}
+
+
+def _render_database_backup_restore():
+    st.markdown("#### Database backup & restore")
+    if DB_PATH.exists():
+        with open(DB_PATH, "rb") as fh:
+            db_bytes = fh.read()
+        st.download_button(
+            "Download current database (.db)",
+            data=db_bytes,
+            file_name=DB_PATH.name,
+            mime="application/octet-stream",
+            key="admin_db_download",
+        )
+    else:
+        st.warning("Database file was not found yet. Save some data first, then download a backup.")
+
+    uploaded_db = st.file_uploader(
+        "Restore database from backup (.db)",
+        type=["db"],
+        key="admin_db_restore_upload",
+        help="Uploading a .db file will replace the current school.db data immediately.",
+    )
+    if uploaded_db is not None:
+        uploaded_sig = f"{uploaded_db.name}:{uploaded_db.size}"
+        if st.session_state.get("admin_last_restored_db_sig") != uploaded_sig:
+            try:
+                backup_before_restore = BACKUP_DIR / f"school_pre_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+                if DB_PATH.exists():
+                    shutil.copy2(DB_PATH, backup_before_restore)
+
+                tmp_restore_path = DB_PATH.with_suffix(".restore.tmp")
+                with open(tmp_restore_path, "wb") as fh:
+                    fh.write(uploaded_db.getbuffer())
+                tmp_restore_path.replace(DB_PATH)
+
+                st.session_state["admin_last_restored_db_sig"] = uploaded_sig
+                st.success("Database restored successfully. All local records were replaced from the uploaded backup.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Database restore failed: {exc}")
+
+
+def _render_developer_admin_panel():
+    if not _developer_mode_requested():
+        return
+
+    st.sidebar.divider()
+    st.sidebar.caption("Developer mode is enabled.")
+
+    if st.session_state.get("developer_admin_unlocked"):
+        if st.sidebar.button("Lock developer tools", key="developer_lock_tools"):
+            st.session_state.pop("developer_admin_unlocked", None)
+            st.rerun()
+    else:
+        with st.sidebar.form("developer_access_form"):
+            developer_password = st.text_input("Developer password", type="password")
+            unlock_submitted = st.form_submit_button("Unlock developer tools")
+            if unlock_submitted:
+                if developer_password == DEVELOPER_ACCESS_PASSWORD:
+                    st.session_state["developer_admin_unlocked"] = True
+                    st.rerun()
+                else:
+                    st.sidebar.error("Incorrect developer password.")
+
+    if not st.session_state.get("developer_admin_unlocked"):
+        return
+
+    st.divider()
+    st.subheader("🛠️ Developer Console")
+    st.caption("Developer-only billing, feedback, and database tools.")
+
+    _render_database_backup_restore()
+
+    pending_requests = [
+        req for req in get_payment_requests(limit=200)
+        if str(req.get("status") or "").lower() == "pending"
+    ]
+    feedback_items = get_recent_suggestions(limit=200)
+
+    st.divider()
+    st.markdown("#### Pending premium approvals")
+    if not pending_requests:
+        st.info("No pending payment requests right now.")
+    else:
+        for request in pending_requests:
+            request_id = request.get("request_id")
+            user_name = request.get("user_name") or "Unknown user"
+            user_role = request.get("user_role") or "Student"
+            created_at = request.get("created_at") or ""
+            with st.expander(f"{user_name} · {user_role} · {created_at}"):
+                st.write(f"Reference: {request.get('reference') or 'N/A'}")
+                st.write(f"Identifier: {request.get('user_identifier') or 'N/A'}")
+                st.write(f"Email: {request.get('user_email') or 'N/A'}")
+                if request.get("note"):
+                    st.caption(request.get("note"))
+
+                approve_key = f"approve_payment_{request_id}"
+                if st.button("Approve pending premium key", key=approve_key, type="primary"):
+                    ok, message = grant_premium_access(
+                        request.get("user_role") or "Student",
+                        user_identifier=request.get("user_identifier"),
+                        user_email=request.get("user_email"),
+                        days=PREMIUM_DAYS_DEFAULT,
+                    )
+                    if ok:
+                        update_payment_request_status(
+                            request_id,
+                            "approved",
+                            reviewed_by="Developer",
+                            reviewed_note="Approved in Developer Console",
+                        )
+                        st.success(message)
+                        st.rerun()
+                    else:
+                        st.error(message)
+
+    st.divider()
+    st.markdown("#### Student feedback inbox")
+    if not feedback_items:
+        st.info("No feedback entries yet.")
+    else:
+        for item in feedback_items:
+            category = item.get("category") or "Feedback"
+            user_name = item.get("user_name") or "Anonymous"
+            created_at = item.get("created_at") or ""
+            with st.expander(f"{category} · {user_name} · {created_at}"):
+                st.write(item.get("message") or "")
+                st.caption(f"Role: {item.get('user_role') or 'Unknown'} · Email: {item.get('user_email') or 'N/A'}")
+
+
 # --------------------------------------------------------------------------- #
 # UI — Teacher
 # --------------------------------------------------------------------------- #
@@ -2600,7 +2735,7 @@ def teacher_view(model):
             st.session_state.pop(key, None)
         st.rerun()
 
-    tab_profile, tab_upload, tab_flashcards, tab_assessments, tab_to_check, tab_resources, tab_questions, tab_admin = st.tabs([
+    tab_profile, tab_upload, tab_flashcards, tab_assessments, tab_to_check, tab_resources, tab_questions = st.tabs([
         "🏫 My classes & subjects",
         "📤 Upload lecture",
         "🧠 Manage flashcards",
@@ -2608,7 +2743,6 @@ def teacher_view(model):
         "✅ To be checked",
         "📚 Resources",
         "💬 Student questions",
-        "⚙️ Admin & Billing",
     ])
 
     with tab_profile:
@@ -2808,66 +2942,6 @@ def teacher_view(model):
                             st.success("Reply saved.")
                 st.divider()
 
-    with tab_admin:
-        st.subheader("⚙️ Admin & Billing")
-        st.caption("Review pending premium payments and recent student feedback.")
-        pending_requests = [
-            req for req in get_payment_requests(limit=200)
-            if str(req.get("status") or "").lower() == "pending"
-        ]
-        feedback_items = get_recent_suggestions(limit=200)
-
-        st.markdown("#### Pending premium approvals")
-        if not pending_requests:
-            st.info("No pending payment requests right now.")
-        else:
-            for request in pending_requests:
-                request_id = request.get("request_id")
-                user_name = request.get("user_name") or "Unknown user"
-                user_role = request.get("user_role") or "Student"
-                created_at = request.get("created_at") or ""
-                with st.expander(f"{user_name} · {user_role} · {created_at}"):
-                    st.write(f"Reference: {request.get('reference') or 'N/A'}")
-                    st.write(f"Identifier: {request.get('user_identifier') or 'N/A'}")
-                    st.write(f"Email: {request.get('user_email') or 'N/A'}")
-                    if request.get("note"):
-                        st.caption(request.get("note"))
-
-                    approve_key = f"approve_payment_{request_id}"
-                    if st.button("Approve pending premium key", key=approve_key, type="primary"):
-                        ok, message = grant_premium_access(
-                            request.get("user_role") or "Student",
-                            user_identifier=request.get("user_identifier"),
-                            user_email=request.get("user_email"),
-                            days=PREMIUM_DAYS_DEFAULT,
-                        )
-                        if ok:
-                            reviewer = st.session_state.get("teacher_name") or "Admin"
-                            update_payment_request_status(
-                                request_id,
-                                "approved",
-                                reviewed_by=reviewer,
-                                reviewed_note="Approved in Admin & Billing tab",
-                            )
-                            st.success(message)
-                            st.rerun()
-                        else:
-                            st.error(message)
-
-        st.divider()
-        st.markdown("#### Student feedback inbox")
-        if not feedback_items:
-            st.info("No feedback entries yet.")
-        else:
-            for item in feedback_items:
-                category = item.get("category") or "Feedback"
-                user_name = item.get("user_name") or "Anonymous"
-                created_at = item.get("created_at") or ""
-                with st.expander(f"{category} · {user_name} · {created_at}"):
-                    st.write(item.get("message") or "")
-                    st.caption(f"Role: {item.get('user_role') or 'Unknown'} · Email: {item.get('user_email') or 'N/A'}")
- 
- 
 # --------------------------------------------------------------------------- #
 # UI — Student: flashcards + study tools
 # --------------------------------------------------------------------------- #
@@ -3992,6 +4066,7 @@ def main():
         _render_study_streak_sidebar()
     
     model = DEFAULT_MODEL
+    _render_developer_admin_panel()
 
     if not ai_ready(model):
         st.sidebar.warning("AI features are off (no key set) — video + notes still work.")
