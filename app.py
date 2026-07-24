@@ -174,11 +174,16 @@ load_dotenv()
 # --------------------------------------------------------------------------- #
 # Storage + config
 # --------------------------------------------------------------------------- #
-# Set SCHOLARWAVE_DATA_DIR to a persistent folder in production.
-DATA_DIR = Path(os.environ.get("SCHOLARWAVE_DATA_DIR", str(Path(__file__).with_name("lecture_data")))).expanduser()
+if os.path.exists("/data"):
+    DATA_DIR = Path("/data")
+else:
+    DATA_DIR = Path(__file__).with_name("lecture_data")
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "school.db"
+
 VIDEO_DIR = DATA_DIR / "videos"
 INDEX_FILE = DATA_DIR / "index.json"
-DB_PATH = DATA_DIR / "school.db"          # <-- preference-system database lives alongside lecture data
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_RETENTION = int(os.environ.get("SCHOLARWAVE_BACKUP_RETENTION", "30"))
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
